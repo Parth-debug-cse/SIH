@@ -48,11 +48,15 @@ class PipelineRunner:
         video_path: str | Path,
         camera_config: dict[str, Any],
         device: Optional[str] = None,
+        min_ocr_confidence: float = 0.50,
+        min_vehicle_height_px: int = 60,
     ) -> None:
         self.camera_id = camera_id
         self.video_path = Path(video_path)
         self.camera_config = camera_config
         self.device = device
+        self.min_ocr_confidence = min_ocr_confidence
+        self.min_vehicle_height_px = min_vehicle_height_px
 
         self.gps_lat: float = camera_config.get("gps_lat", 0.0)
         self.gps_lon: float = camera_config.get("gps_lon", 0.0)
@@ -260,6 +264,33 @@ class PipelineRunner:
                 alerts_triggered += len(alerts)
                 self._alerts.extend(alerts)
 
+        # 2b. Plate-crop fallback: when no plate model exists, crop the
+        # lower-center region of each vehicle bbox (where plates sit) and OCR.
+        if not plates and vehicles:
+            crop_reads = self._ocr_vehicle_plate_crops(frame, vehicles, frame_number)
+            ocr_plates.extend(crop_reads["plate_entries"])
+            plates_read += crop_reads["read_count"]
+
+            for sighting in crop_reads["sightings"]:
+                self._insert_sighting(sighting)
+                self.fusion.add_sighting(
+                    plate=sighting["plate"],
+                    camera_id=self.camera_id,
+                    gps_lat=self.gps_lat,
+                    gps_lon=self.gps_lon,
+                    timestamp=sighting["timestamp"],
+                    confidence=sighting["confidence"],
+                )
+                alerts = self.alert_engine.check_plate(
+                    plate=sighting["plate"],
+                    camera_id=self.camera_id,
+                    gps_lat=self.gps_lat,
+                    gps_lon=self.gps_lon,
+                    timestamp=sighting["timestamp"],
+                )
+                alerts_triggered += len(alerts)
+                self._alerts.extend(alerts)
+
         # 4. Tracking
         tracked = self.tracker.update(vehicles, frame=frame)
 
@@ -284,6 +315,103 @@ class PipelineRunner:
             "plates": ocr_plates,
             "tracked": tracked,
         }
+
+    def _ocr_vehicle_plate_crops(
+        self, frame: np.ndarray, vehicles: list[dict], frame_number: int
+    ) -> dict[str, Any]:
+        """OCR the lower-center crop of each vehicle bbox (plate location).
+
+        No dedicated plate-detection model is available, so we crop the
+        region of each vehicle where number plates typically sit (bottom
+        ~20% of the bbox) and run OCR on the real pixels.
+        """
+        h_max, w_max = frame.shape[:2]
+        plate_entries: list[dict[str, Any]] = []
+        sightings: list[dict[str, Any]] = []
+        read_count = 0
+        candidates = 0
+
+        for idx, veh in enumerate(vehicles):
+            x1, y1, x2, y2 = veh["bbox"]
+            veh_h = y2 - y1
+            if veh_h < self.min_vehicle_height_px:
+                continue
+            candidates += 1
+
+            bw = (x2 - x1) * 1.0
+            bh = (y2 - y1) * 0.30
+            px1 = int(x1 + bw * 0.15)
+            py1 = int(y2 - bh)
+            px2 = int(x2 - bw * 0.15)
+            py2 = int(y2 - 1)
+
+            # Clamp to frame
+            cx1 = max(0, min(px1, w_max))
+            cy1 = max(0, min(py1, h_max))
+            cx2 = max(0, min(px2, w_max))
+            cy2 = max(0, min(py2, h_max))
+            if cx2 <= cx1 or cy2 <= cy1:
+                continue
+
+            crop = frame[cy1:cy2, cx1:cx2]
+            # Skip tiny crops
+            if crop.shape[0] < 10 or crop.shape[1] < 20:
+                continue
+
+            # Upscale 2x so OCR can see small plate glyphs
+            upscale = cv2.resize(crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+            ocr_result = self.ocr.read_plate(upscale)
+            text = ocr_result["text"]
+            conf = ocr_result["confidence"]
+
+            entry = {
+                "bbox": [cx1, cy1, cx2, cy2],
+                "confidence": 0.0,
+                "plate_text": text,
+                "ocr_confidence": conf,
+                "vehicle_idx": idx,
+                "source": "vehicle_crop_fallback",
+            }
+            plate_entries.append(entry)
+
+            # Only accept confident plate readings (anti-hallucination gate)
+            if text and conf >= self.min_ocr_confidence:
+                read_count += 1
+                ts = datetime.now().timestamp()
+                sightings.append(
+                    {
+                        "plate": text,
+                        "camera_id": self.camera_id,
+                        "gps_lat": self.gps_lat,
+                        "gps_lon": self.gps_lon,
+                        "timestamp": ts,
+                        "confidence": conf,
+                        "vehicle_bbox": veh["bbox"],
+                        "plate_bbox": [cx1, cy1, cx2, cy2],
+                        "frame_number": frame_number,
+                        "class_name": veh["class_name"],
+                    }
+                )
+            elif text:
+                logger.debug(
+                    "Rejected low-confidence plate reading '%s' (conf=%.2f < %.2f)",
+                    text,
+                    conf,
+                    self.min_ocr_confidence,
+                )
+
+        if read_count:
+            logger.info(
+                "Frame %d: plate-crop fallback read %d plate(s) from %d vehicle crop(s) "
+                "(%d candidates)",
+                frame_number,
+                read_count,
+                len(plate_entries),
+                candidates,
+            )
+
+        return {"plate_entries": plate_entries, "sightings": sightings, "read_count": read_count}
 
     # ------------------------------------------------------------------
     # Internal helpers
