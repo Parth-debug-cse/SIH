@@ -1,0 +1,31 @@
+{
+  "cameras": [
+    {
+      "camera_id": "cam_1",
+      "video_file": "camera_1.mp4",
+      "gps_lat": 12.9758,
+      "gps_lon": 77.6082,
+      "description": "MG Road - Trinity Circle junction",
+      "pixel_to_meter_ratio": 0.05,
+      "compass_bearing": 45
+    },
+    {
+      "camera_id": "cam_2",
+      "video_file": "camera_2.mp4",
+      "gps_lat": 12.9768,
+      "gps_lon": 77.6050,
+      "description": "MG Road - near Anil Kumble Circle",
+      "pixel_to_meter_ratio": 0.06,
+      "compass_bearing": 120
+    },
+    {
+      "camera_id": "cam_3",
+      "video_file": "camera_3.mp4",
+      "gps_lat": 12.9745,
+      "gps_lon": 77.6095,
+      "description": "Brigade Road intersection",
+      "pixel_to_meter_ratio": 0.04,
+      "compass_bearing": 200
+    }
+  ]
+}
