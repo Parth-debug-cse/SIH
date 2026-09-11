@@ -85,20 +85,34 @@ class PlateOCR:
     # Preprocessing
     # ------------------------------------------------------------------
 
-    def preprocess_plate(self, plate_image: np.ndarray) -> np.ndarray:
-        """Apply preprocessing to a plate crop.
+    def preprocess_plate(
+        self,
+        plate_image: np.ndarray,
+        upscale_factor: float = 3.0,
+        clahe_clip_limit: float = 3.0,
+        clahe_tile_grid_size: int = 8,
+        unsharp_sigma: float = 1.5,
+        unsharp_amount: float = 1.0,
+    ) -> np.ndarray:
+        """Preprocess a plate crop before EasyOCR.
 
-        Steps:
+        This is the single isolated, tunable preprocessing stage applied only
+        to the plate crop.  Steps (in order):
+
             1. Convert to grayscale.
             2. Apply CLAHE contrast enhancement.
-            3. Resize to standard height (32 px) preserving aspect ratio.
-            4. Convert back to 3-channel BGR for OCR.
+            3. Upscale ``upscale_factor``-fold (3-4x) with ``cv2.INTER_CUBIC``
+               so the plate glyphs render large enough for EasyOCR.
+            4. Unsharp-mask sharpen to restore edge contrast.
+
+        Returns a 3-channel BGR image ready for OCR.
         """
         if plate_image is None or plate_image.size == 0:
             raise ValueError("plate_image is empty or None")
 
         img = plate_image.copy()
 
+        # 1. Grayscale.
         if img.ndim == 3 and img.shape[2] == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         elif img.ndim == 2:
@@ -106,20 +120,33 @@ class PlateOCR:
         else:
             raise ValueError(f"Unexpected image shape: {img.shape}")
 
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # 2. CLAHE contrast enhancement.
+        clahe = cv2.createCLAHE(
+            clipLimit=clahe_clip_limit,
+            tileGridSize=(clahe_tile_grid_size, clahe_tile_grid_size),
+        )
         enhanced = clahe.apply(gray)
 
-        target_h = 32
+        # 3. 3-4x upscale with cubic interpolation.
+        scale = max(float(upscale_factor), 1.0)
         h, w = enhanced.shape[:2]
-        if h <= 0:
-            raise ValueError(f"Invalid image height: {h}")
-        scale = target_h / h
+        if h <= 0 or w <= 0:
+            raise ValueError(f"Invalid image dimensions: {enhanced.shape}")
         target_w = max(int(w * scale), 1)
-        resized = cv2.resize(
-            enhanced, (target_w, target_h), interpolation=cv2.INTER_CUBIC
+        target_h = max(int(h * scale), 1)
+        upscaled = cv2.resize(
+            enhanced,
+            (target_w, target_h),
+            interpolation=cv2.INTER_CUBIC,
         )
 
-        return cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+        # 4. Unsharp-mask sharpen.
+        blurred = cv2.GaussianBlur(upscaled, (0, 0), unsharp_sigma)
+        sharpened = cv2.addWeighted(
+            upscaled, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0.0
+        )
+
+        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
 
     @staticmethod
     def _clean_plate_text(text: str) -> str:

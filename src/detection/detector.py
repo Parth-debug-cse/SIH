@@ -23,16 +23,44 @@ _VEHICLE_CLASS_IDS = set(VEHICLE_CLASSES.keys())
 
 _DEFAULT_VEHICLE_MODEL = "yolov8n.pt"
 
+# Pretrained license-plate detector fetched from Hugging Face.
+# Koushim/yolov8-license-plate-detection is a YOLOv8n fine-tuned for a single
+# class ("license_plate"); the weights file is ``best.pt`` (confirmed on the
+# model card / repo file listing).
+HF_PLATE_MODEL_REPO_ID = "Koushim/yolov8-license-plate-detection"
+HF_PLATE_MODEL_FILENAME = "best.pt"
+
+
+def resolve_plate_model_from_hub(
+    repo_id: str = HF_PLATE_MODEL_REPO_ID,
+    filename: str = HF_PLATE_MODEL_FILENAME,
+) -> Path:
+    """Download (or fetch cached) plate-detection weights from Hugging Face.
+
+    Uses ``huggingface_hub.hf_hub_download`` so the weights are cached by hub
+    and only fetched once.  Returns the local path to the weights file.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface_hub is required to fetch the license-plate detector. "
+            "Install it with: pip install huggingface_hub"
+        ) from exc
+
+    path = hf_hub_download(repo_id=repo_id, filename=filename)
+    logger.info("License-plate detector weights fetched from %s/%s (%s)",
+                repo_id, filename, path)
+    return Path(path)
+
 
 class PlateDetector:
     """YOLOv8-based detector for vehicles and license plates.
 
-    Supports two detection strategies for plates:
-    1. Dedicated plate detection model (preferred).
-    2. Fallback: crop each detected vehicle bbox and run the vehicle model,
-       expecting a plate-related class – not implemented here; instead we
-       simply return an empty list when no plate model is provided so that
-       downstream OCR can attempt to read plates from vehicle crops.
+    Plate localization uses a dedicated plate model (fetched from Hugging Face
+    by default) run on each vehicle crop via :meth:`detect_plates_in_crop`.
+    There is no heuristic fallback: when no plate box clears the plate
+    confidence threshold, the caller must skip OCR for that vehicle.
     """
 
     def __init__(
@@ -100,6 +128,11 @@ class PlateDetector:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def plate_conf_threshold(self) -> float:
+        """Minimum confidence for a plate detection (the "plate box" gate)."""
+        return self._plate_conf
 
     def detect_vehicles(self, frame: np.ndarray) -> list[dict]:
         """Detect vehicles in *frame*.
@@ -200,6 +233,60 @@ class PlateDetector:
             logger.debug("No plate model available; skipping plate detection.")
 
         return detections
+
+    def detect_plates_in_crop(
+        self,
+        frame: np.ndarray,
+        vehicle_bbox: list[int],
+        pad_ratio: float = 0.10,
+    ) -> list[dict]:
+        """Localize the license plate within a single vehicle crop.
+
+        The dedicated plate model is run on the crop of *vehicle_bbox* (not
+        the full frame) so the plate box is found within the vehicle.  The
+        vehicle box is expanded by ``pad_ratio`` on each side before cropping
+        so plates near the edge of the vehicle detection are not lost.
+
+        There is **no heuristic fallback**: if the model cannot localize a
+        plate above the configured confidence threshold (0.25) an empty list
+        is returned and the caller must skip OCR for that vehicle.
+
+        Returns
+        -------
+        list[dict]
+            Plate boxes in **full-frame** pixel coordinates; each dict is the
+            same shape as :meth:`detect_plates` (``bbox``, ``confidence``,
+            ``plate_text``, ``vehicle_idx``).
+        """
+        if frame is None or frame.size == 0:
+            logger.warning("Empty frame passed to detect_plates_in_crop.")
+            return []
+        if self._plate_model is None:
+            raise RuntimeError(
+                "detect_plates_in_crop requires a dedicated plate model; "
+                "none is loaded."
+            )
+
+        h_max, w_max = frame.shape[:2]
+        x1, y1, x2, y2 = vehicle_bbox
+        pad_x = int((x2 - x1) * pad_ratio)
+        pad_y = int((y2 - y1) * pad_ratio)
+
+        cx1 = max(0, int(x1) - pad_x)
+        cy1 = max(0, int(y1) - pad_y)
+        cx2 = min(w_max, int(x2) + pad_x)
+        cy2 = min(h_max, int(y2) + pad_y)
+        if cx2 <= cx1 or cy2 <= cy1:
+            logger.debug("Degenerate vehicle crop; skipping plate detection.")
+            return []
+
+        crop = frame[cy1:cy2, cx1:cx2]
+        dets = self._detect_plates_model(crop)
+        for det in dets:
+            bx1, by1, bx2, by2 = det["bbox"]
+            # Offset the crop-relative box back into full-frame coordinates.
+            det["bbox"] = [bx1 + cx1, by1 + cy1, bx2 + cx1, by2 + cy1]
+        return dets
 
     def detect(self, frame: np.ndarray) -> dict:
         """Run full pipeline: vehicles then plates.

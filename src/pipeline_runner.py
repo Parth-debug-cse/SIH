@@ -26,7 +26,12 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from src.detection.detector import PlateDetector
+from src.detection.detector import (
+    HF_PLATE_MODEL_FILENAME,
+    HF_PLATE_MODEL_REPO_ID,
+    PlateDetector,
+    resolve_plate_model_from_hub,
+)
 from src.ocr.reader import PlateOCR
 from src.tracking.tracker import VehicleTracker
 from src.alerts.engine import AlertEngine
@@ -122,7 +127,14 @@ class PipelineRunner:
             self.compass_bearing,
         )
 
-        self.detector = PlateDetector(device=self.device)
+        # Load the dedicated license-plate detector from Hugging Face.  This is
+        # a hard dependency of the plate-localization stage: without weights the
+        # stage cannot run, so fail loudly rather than silently producing zero
+        # plate reads or falling back to the old heuristic crop.
+        logger.info("Fetching license-plate detector from Hugging Face (%s/%s) …",
+                    HF_PLATE_MODEL_REPO_ID, HF_PLATE_MODEL_FILENAME)
+        plate_model_path = resolve_plate_model_from_hub()
+        self.detector = PlateDetector(device=self.device, plate_model_path=plate_model_path)
         self.ocr = PlateOCR()
         self.tracker = VehicleTracker()
         self.alert_engine = AlertEngine()
@@ -131,6 +143,17 @@ class PipelineRunner:
         self._sightings: list[dict[str, Any]] = []
         self._alerts: list[dict[str, Any]] = []
         self._analytics_entries: list[dict[str, Any]] = []
+
+        # Per-run diagnostics for the detection -> OCR path.
+        self._diag: dict[str, Any] = {
+            "vehicles_detected": 0,
+            "vehicle_too_small": 0,
+            "vehicles_with_plate_box": 0,
+            "no_plate_box_found": 0,
+            "plate_found_below_gate": 0,
+            "plate_crop_heights": [],
+            "plate_gate_cleared": 0,
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -243,7 +266,52 @@ class PipelineRunner:
             summary["plates_read"],
             summary["alerts_triggered"],
         )
+
+        summary["plate_diagnostics"] = {
+            "vehicles_detected": self._diag["vehicles_detected"],
+            "vehicle_too_small": self._diag["vehicle_too_small"],
+            "vehicles_with_plate_box": self._diag["vehicles_with_plate_box"],
+            "no_plate_box_found": self._diag["no_plate_box_found"],
+            "plate_found_below_gate": self._diag["plate_found_below_gate"],
+            "plate_crop_heights_px": self._diag["plate_crop_heights"],
+            "plate_confidence_gate_cleared": self._diag["plate_gate_cleared"],
+        }
+        self._print_diagnostic_summary(summary)
         return summary
+
+    def _print_diagnostic_summary(self, summary: dict[str, Any]) -> None:
+        """Print the per-run detection -> OCR diagnostic breakdown."""
+        d = self._diag
+        heights: list[int] = d["plate_crop_heights"]
+        attempted = d["vehicles_detected"] - d["vehicle_too_small"]
+        plate_conf = self.detector.plate_conf_threshold
+        agg = (
+            f"{min(heights)} / {sum(heights)/len(heights):.1f} / {max(heights)}"
+            if heights else "n/a"
+        )
+
+        lines = [
+            "",
+            "===== PLATE DIAGNOSTIC SUMMARY =====",
+            f"Camera                       : {self.camera_id}",
+            f"Video                        : {self.video_path.name}",
+            f"Frames processed             : {summary['frames_processed']}",
+            f"Vehicles detected            : {d['vehicles_detected']}",
+            f"  - too small to attempt     : {d['vehicle_too_small']}  (height < {self.min_vehicle_height_px}px)",
+            f"  - attempted                : {attempted}",
+            f"  - no plate box found       : {d['no_plate_box_found']}  (plate conf < {plate_conf})",
+            f"  - plate box localized      : {d['vehicles_with_plate_box']}",
+            f"Plate crop height (px)       : {heights}",
+            f"  - min / avg / max          : {agg}",
+            f"Plate found but below gate   : {d['plate_found_below_gate']}  (ocr conf < {self.min_ocr_confidence})",
+            f"Plate gate cleared           : {d['plate_gate_cleared']}  (ocr conf >= {self.min_ocr_confidence})",
+            f"Plates read (sightings)      : {summary['plates_read']}",
+            f"Alerts triggered             : {summary['alerts_triggered']}",
+            "==================================",
+        ]
+        text = "\n".join(lines)
+        print(text)
+        logger.info(text)
 
     def process_frame(self, frame: np.ndarray, frame_number: int) -> dict[str, Any]:
         """Process a single frame through detection, tracking, OCR, and alerts.
@@ -259,10 +327,8 @@ class PipelineRunner:
         """
         ts = datetime.now().timestamp()
 
-        # 1. Detection
-        det_result = self.detector.detect(frame)
-        vehicles = det_result["vehicles"]
-        plates = det_result["plates"]
+        # 1. Detection (vehicles only; plates are localized per-vehicle below)
+        vehicles = self.detector.detect_vehicles(frame)
 
         class_counts = Counter(v.get("class_name", "?") for v in vehicles)
         logger.debug(
@@ -283,30 +349,21 @@ class PipelineRunner:
         vehicles_detected = len(vehicles)
         plates_read = 0
         alerts_triggered = 0
+        self._diag["vehicles_detected"] += vehicles_detected
 
         ocr_plates: list[dict[str, Any]] = []
 
-        # 3a. OCR on each directly detected plate (requires a plate model)
-        for plate_det in plates:
-            plate_entry, sighting = self._process_plate_detection(
-                frame, plate_det, vehicles, veh_track_ids, ts, frame_number
-            )
-            if plate_entry is not None:
-                ocr_plates.append(plate_entry)
-                if sighting is not None:
-                    plates_read += 1
-                    self._handle_sighting(sighting)
-
-        # 3b. Plate-crop fallback: when no plate model exists, crop the
-        # lower-center region of each vehicle bbox (where plates sit) and OCR.
-        if not plates and vehicles:
-            crop_reads = self._ocr_vehicle_plate_crops(
-                frame, vehicles, veh_track_ids, frame_number
-            )
-            ocr_plates.extend(crop_reads["plate_entries"])
-            plates_read += crop_reads["read_count"]
-            for sighting in crop_reads["sightings"]:
-                self._handle_sighting(sighting)
+        # 3. Per-vehicle plate localization -> OCR.  The dedicated plate model
+        # runs on each vehicle crop (not the full frame).  If no plate box
+        # clears the plate confidence threshold, OCR is skipped for that
+        # vehicle entirely - there is no fallback to the old heuristic crop.
+        crop_ocr = self._ocr_vehicle_plates_by_model(
+            frame, vehicles, veh_track_ids, frame_number
+        )
+        ocr_plates = crop_ocr["plate_entries"]
+        plates_read = crop_ocr["read_count"]
+        for sighting in crop_ocr["sightings"]:
+            self._handle_sighting(sighting)
 
         # 4. Analytics (active track ids + per-track speeds)
         active_ids = [t["track_id"] for t in tracked]
@@ -365,173 +422,142 @@ class PipelineRunner:
             return (self.camera_id, int(track_id))
         return (self.camera_id, f"unmatched:{frame_number}:{index}")
 
-    def _process_plate_detection(
-        self,
-        frame: np.ndarray,
-        plate_det: dict,
-        vehicles: list[dict],
-        veh_track_ids: dict[int, Optional[int]],
-        ts: float,
-        frame_number: int,
-    ) -> tuple[Optional[dict], Optional[dict]]:
-        """OCR a directly-detected plate and build a sighting when accepted."""
-        x1, y1, x2, y2 = plate_det["bbox"]
-        h, w = frame.shape[:2]
-        cx1 = max(0, int(x1))
-        cy1 = max(0, int(y1))
-        cx2 = min(w, int(x2))
-        cy2 = min(h, int(y2))
-
-        if cx2 <= cx1 or cy2 <= cy1:
-            logger.debug("[OCR] skipping degenerate plate crop at frame %d", frame_number)
-            return None, None
-
-        veh_idx = plate_det.get("vehicle_idx", -1)
-        track_id = (
-            veh_track_ids.get(veh_idx)
-            if 0 <= veh_idx < len(vehicles) else None
-        )
-        track_key = self._track_key(track_id, frame_number, veh_idx)
-
-        crop = frame[cy1:cy2, cx1:cx2]
-        ocr_result = self.ocr.read_plate(crop, track_key=track_key)
-        plate_text = ocr_result["text"]
-        plate_confidence = ocr_result["confidence"]
-
-        plate_entry = dict(plate_det)
-        plate_entry["plate_text"] = plate_text
-        plate_entry["ocr_confidence"] = plate_confidence
-        plate_entry["track_id"] = track_id
-
-        if not plate_text or plate_confidence < self.min_ocr_confidence:
-            if plate_text:
-                logger.debug(
-                    "[OCR] rejected low-confidence plate '%s' (conf=%.2f < %.2f)",
-                    plate_text, plate_confidence, self.min_ocr_confidence,
-                )
-            return plate_entry, None
-
-        logger.info("[OCR] %s track=%s plate=%s conf=%.2f (votes=%d)",
-                    self.camera_id, track_id, plate_text, plate_confidence,
-                    ocr_result.get("voted_count", 0))
-
-        sighting = {
-            "plate": plate_text,
-            "camera_id": self.camera_id,
-            "gps_lat": self.gps_lat,
-            "gps_lon": self.gps_lon,
-            "timestamp": ts,
-            "confidence": plate_confidence,
-            "vehicle_bbox": vehicles[veh_idx]["bbox"] if 0 <= veh_idx < len(vehicles) else None,
-            "plate_bbox": plate_det["bbox"],
-            "frame_number": frame_number,
-            "track_id": track_id,
-            "direction": self.direction,
-            "class_name": vehicles[veh_idx].get("class_name") if 0 <= veh_idx < len(vehicles) else None,
-        }
-        return plate_entry, sighting
-
-    def _ocr_vehicle_plate_crops(
+    def _ocr_vehicle_plates_by_model(
         self,
         frame: np.ndarray,
         vehicles: list[dict],
         veh_track_ids: dict[int, Optional[int]],
         frame_number: int,
     ) -> dict[str, Any]:
-        """OCR the lower-center crop of each vehicle bbox (plate location).
+        """Localize each vehicle's plate box and OCR only that plate crop.
 
-        No dedicated plate-detection model is available, so we crop the
-        region of each vehicle where number plates typically sit (bottom
-        ~30% of the bbox) and run OCR on the real pixels.  Each crop is read
-        and voted on under its own ``(camera_id, track_id)`` identity.
+        For every vehicle that clears ``min_vehicle_height_px``:
+
+        1. The dedicated plate model runs on the vehicle crop to find the
+           plate box within the vehicle.
+        2. If no plate box clears the plate confidence threshold (0.25), OCR
+           is skipped for that vehicle entirely (no heuristic fallback).
+        3. Otherwise the plate crop is preprocessed (grayscale -> CLAHE ->
+           3-4x upscale -> unsharp) and read by EasyOCR under its
+           ``(camera_id, track_id)`` voting identity.
+
+        Diagnostics distinguish *vehicle too small*, *no plate box found*,
+        *plate found but below confidence gate*, and *gate cleared*.
         """
         h_max, w_max = frame.shape[:2]
         plate_entries: list[dict[str, Any]] = []
         sightings: list[dict[str, Any]] = []
         read_count = 0
-        candidates = 0
 
         for idx, veh in enumerate(vehicles):
             x1, y1, x2, y2 = veh["bbox"]
             veh_h = y2 - y1
             if veh_h < self.min_vehicle_height_px:
-                continue
-            candidates += 1
-
-            bw = (x2 - x1) * 1.0
-            bh = (y2 - y1) * 0.30
-            px1 = int(x1 + bw * 0.15)
-            py1 = int(y2 - bh)
-            px2 = int(x2 - bw * 0.15)
-            py2 = int(y2 - 1)
-
-            # Clamp to frame
-            cx1 = max(0, min(px1, w_max))
-            cy1 = max(0, min(py1, h_max))
-            cx2 = max(0, min(px2, w_max))
-            cy2 = max(0, min(py2, h_max))
-            if cx2 <= cx1 or cy2 <= cy1:
+                logger.info(
+                    "[PLATE] %s frame=%d veh=%d vehicle too small to attempt "
+                    "(h=%dpx < min_vehicle_height_px=%d)",
+                    self.camera_id, frame_number, idx,
+                    veh_h, self.min_vehicle_height_px,
+                )
+                self._diag["vehicle_too_small"] += 1
                 continue
 
-            crop = frame[cy1:cy2, cx1:cx2]
-            # Skip tiny crops
-            if crop.shape[0] < 10 or crop.shape[1] < 20:
+            # Run the plate model on the vehicle crop (not the full frame).
+            plate_dets = self.detector.detect_plates_in_crop(frame, veh["bbox"])
+            if not plate_dets:
+                logger.info(
+                    "[PLATE] %s frame=%d veh=%d no plate box found (plate conf < %s)",
+                    self.camera_id, frame_number, idx,
+                    self.detector.plate_conf_threshold,
+                )
+                self._diag["no_plate_box_found"] += 1
+                continue
+
+            best = max(plate_dets, key=lambda p: p["confidence"])
+            self._diag["vehicles_with_plate_box"] += 1
+
+            bx1 = max(0, min(int(best["bbox"][0]), w_max))
+            by1 = max(0, min(int(best["bbox"][1]), h_max))
+            bx2 = max(0, min(int(best["bbox"][2]), w_max))
+            by2 = max(0, min(int(best["bbox"][3]), h_max))
+            if bx2 <= bx1 or by2 <= by1:
+                logger.debug(
+                    "[OCR] %s frame=%d veh=%d degenerate plate box; skipping",
+                    self.camera_id, frame_number, idx,
+                )
+                continue
+
+            crop_h = by2 - by1
+            crop_w = bx2 - bx1
+            self._diag["plate_crop_heights"].append(crop_h)
+
+            crop = frame[by1:by2, bx1:bx2]
+            if crop_w < 20 or crop_h < 10:
+                logger.debug(
+                    "[OCR] %s frame=%d veh=%d plate crop too small (w=%d h=%d); skipping",
+                    self.camera_id, frame_number, idx, crop_w, crop_h,
+                )
                 continue
 
             track_id = veh_track_ids.get(idx)
             track_key = self._track_key(track_id, frame_number, idx)
 
-            # Upscale 2x so OCR can see small plate glyphs
-            upscale = cv2.resize(crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-
-            ocr_result = self.ocr.read_plate(upscale, track_key=track_key)
+            ocr_result = self.ocr.read_plate(crop, track_key=track_key)
             text = ocr_result["text"]
             conf = ocr_result["confidence"]
 
             entry = {
-                "bbox": [cx1, cy1, cx2, cy2],
-                "confidence": 0.0,
+                "bbox": [bx1, by1, bx2, by2],
+                "confidence": best["confidence"],
                 "plate_text": text,
                 "ocr_confidence": conf,
                 "vehicle_idx": idx,
                 "track_id": track_id,
-                "source": "vehicle_crop_fallback",
+                "source": "plate_model",
             }
             plate_entries.append(entry)
 
-            # Only accept confident plate readings (anti-hallucination gate)
-            if text and conf >= self.min_ocr_confidence:
-                read_count += 1
-                ts = datetime.now().timestamp()
-                logger.info("[OCR] %s track=%s plate=%s conf=%.2f (votes=%d)",
-                            self.camera_id, track_id, text, conf,
-                            ocr_result.get("voted_count", 0))
-                sightings.append(
-                    {
-                        "plate": text,
-                        "camera_id": self.camera_id,
-                        "gps_lat": self.gps_lat,
-                        "gps_lon": self.gps_lon,
-                        "timestamp": ts,
-                        "confidence": conf,
-                        "vehicle_bbox": veh["bbox"],
-                        "plate_bbox": [cx1, cy1, cx2, cy2],
-                        "frame_number": frame_number,
-                        "track_id": track_id,
-                        "direction": self.direction,
-                        "class_name": veh["class_name"],
-                    }
+            if not text:
+                logger.info(
+                    "[OCR] %s frame=%d veh=%d plate found but OCR read nothing",
+                    self.camera_id, frame_number, idx,
                 )
-            elif text:
-                logger.debug(
-                    "[OCR] %s rejected low-confidence plate reading '%s' (conf=%.2f < %.2f)",
-                    self.camera_id, text, conf, self.min_ocr_confidence,
-                )
+                continue
 
-        if read_count:
+            if conf < self.min_ocr_confidence:
+                logger.info(
+                    "[OCR] %s frame=%d veh=%d plate found but below confidence "
+                    "gate '%s' (conf=%.2f < %.2f)",
+                    self.camera_id, frame_number, idx,
+                    text, conf, self.min_ocr_confidence,
+                )
+                self._diag["plate_found_below_gate"] += 1
+                continue
+
+            # Confident reading -> gate cleared -> sighting.
+            read_count += 1
+            self._diag["plate_gate_cleared"] += 1
+            ts = datetime.now().timestamp()
             logger.info(
-                "[SIGHTING] %s frame=%d plate-crop fallback read %d plate(s) from %d vehicle crop(s) (%d candidates)",
-                self.camera_id, frame_number, read_count, len(plate_entries), candidates,
+                "[OCR] %s track=%s plate=%s conf=%.2f (votes=%d)",
+                self.camera_id, track_id, text, conf,
+                ocr_result.get("voted_count", 0),
+            )
+            sightings.append(
+                {
+                    "plate": text,
+                    "camera_id": self.camera_id,
+                    "gps_lat": self.gps_lat,
+                    "gps_lon": self.gps_lon,
+                    "timestamp": ts,
+                    "confidence": conf,
+                    "vehicle_bbox": veh["bbox"],
+                    "plate_bbox": [bx1, by1, bx2, by2],
+                    "frame_number": frame_number,
+                    "track_id": track_id,
+                    "direction": self.direction,
+                    "class_name": veh["class_name"],
+                }
             )
 
         return {"plate_entries": plate_entries, "sightings": sightings, "read_count": read_count}
