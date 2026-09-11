@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from src.db.schema import get_connection
 
-app = FastAPI(title="ANPR Pipeline API", version="1.0.0")
+app = FastAPI(title="ANPR Pipeline API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,41 +40,127 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Trajectory
+# Fusion (shared cross-camera engine)
 # ---------------------------------------------------------------------------
-@app.get("/trajectory/{plate}")
-def trajectory(plate: str):
+@app.post("/fusion/run")
+def fusion_run():
+    """Trigger the shared fusion engine over the current sightings."""
+    try:
+        from src.fusion.engine import DEFAULT_CAMERAS_PATH, run_fusion_once
+        stats = run_fusion_once(cameras_config_path=str(DEFAULT_CAMERAS_PATH))
+        return {"status": "ok", **stats}
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Fusion failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Trajectory (fused, produced by the fusion engine)
+# ---------------------------------------------------------------------------
+def _trajectory_from_children(traj_row: dict) -> list[dict]:
+    """Build ordered sightings for a trajectory from trajectory_sightings."""
     rows = _query(
-        "SELECT camera_id, gps_lat, gps_lon, timestamp, plate_confidence "
+        "SELECT plate, camera_id, gps_lat, gps_lon, timestamp, direction, "
+        "       confidence, vehicle_class, association_score "
+        "FROM trajectory_sightings WHERE trajectory_id = ? ORDER BY seq",
+        (traj_row["id"],),
+    )
+    return [
+        {
+            "camera_id": r["camera_id"],
+            "gps_lat": r["gps_lat"],
+            "gps_lon": r["gps_lon"],
+            "timestamp": r["timestamp"],
+            "confidence": r["confidence"],
+            "direction": r["direction"],
+            "vehicle_class": r["vehicle_class"],
+            "association_score": r["association_score"],
+        }
+        for r in rows
+    ]
+
+
+def _trajectory_from_raw_sightings(plate: str) -> list[dict]:
+    """Fallback: derive ordered sightings from raw DB rows.
+
+    Used only when a fused trajectory record exists but its child rows were
+    not materialised (e.g. hand-seeded test data).  The response
+    ``route_summary`` marks this case via ``sighting_source``.
+    """
+    rows = _query(
+        "SELECT camera_id, gps_lat, gps_lon, timestamp, plate_confidence, "
+        "       vehicle_class, direction "
         "FROM sightings WHERE plate = ? ORDER BY timestamp",
         (plate,),
     )
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"No sightings for plate '{plate}'")
-
-    sightings = [
+    return [
         {
             "camera_id": r["camera_id"],
             "gps_lat": r["gps_lat"],
             "gps_lon": r["gps_lon"],
             "timestamp": r["timestamp"],
             "confidence": r["plate_confidence"],
+            "direction": r["direction"],
+            "vehicle_class": r["vehicle_class"],
+            "association_score": None,
         }
         for r in rows
     ]
 
-    first_ts = rows[0]["timestamp"]
-    last_ts = rows[-1]["timestamp"]
+
+@app.get("/trajectory/{plate}")
+def trajectory(plate: str):
+    """Return the fused trajectory produced by the fusion engine.
+
+    The response is built from ``trajectories`` + ``trajectory_sightings``
+    (the actual output of the fusion engine), not from ad-hoc raw-sighting
+    queries.  A raw-sighting fallback is used only for trajectory records
+    without materialised children and is flagged in the response.
+    """
+    plate = plate.strip().upper()
+    rows = _query(
+        "SELECT id, trajectory_code, plate, first_camera, last_camera, "
+        "       first_seen, last_seen, num_sightings, route, total_distance_km, "
+        "       total_duration_seconds, trajectory_confidence, source "
+        "FROM trajectories WHERE plate = ? ORDER BY id DESC",
+        (plate,),
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No fused trajectory for plate '{plate}' yet. "
+                   "Raw sightings (if any) are available at /sightings. "
+                   "Run the fusion engine first.",
+        )
+
+    traj = rows[0]
+    sightings = _trajectory_from_children(traj)
+    sighting_source = "trajectory_sightings"
+    if not sightings:
+        sightings = _trajectory_from_raw_sightings(plate)
+        sighting_source = "raw_sightings_fallback"
+
+    duration = traj["total_duration_seconds"]
+    if duration is None and len(sightings) >= 2:
+        duration = sightings[-1]["timestamp"] - sightings[0]["timestamp"]
 
     return {
+        "trajectory_id": traj["id"],
+        "trajectory_code": traj["trajectory_code"],
         "plate": plate,
+        "source": traj["source"],
+        "trajectory_confidence": traj["trajectory_confidence"],
+        "sighting_source": sighting_source,
         "sightings": sightings,
         "route_summary": {
-            "first_camera": rows[0]["camera_id"],
-            "last_camera": rows[-1]["camera_id"],
-            "num_sightings": len(sightings),
-            "duration_seconds": last_ts - first_ts,
+            "first_camera": traj["first_camera"],
+            "last_camera": traj["last_camera"],
+            "num_sightings": traj["num_sightings"],
+            "duration_seconds": duration,
+            "route": traj["route"],
+            "total_distance_km": traj["total_distance_km"],
         },
+        "total_route_duration": duration,
+        "total_distance_km": traj["total_distance_km"],
     }
 
 
@@ -106,7 +192,7 @@ def analytics_density():
 @app.get("/analytics/congestion")
 def analytics_congestion():
     rows = _query(
-        "SELECT camera_id, congestion_flag, vehicle_count, density_level "
+        "SELECT camera_id, congestion_flag, vehicle_count, avg_speed, density_level "
         "FROM analytics ORDER BY timestamp DESC"
     )
     seen: dict[str, dict] = {}
@@ -120,6 +206,7 @@ def analytics_congestion():
             "camera_id": r["camera_id"],
             "is_congested": bool(r["congestion_flag"]),
             "vehicle_count": r["vehicle_count"],
+            "avg_speed": r["avg_speed"],
             "density_level": r["density_level"],
         }
         for r in seen.values()
@@ -128,7 +215,7 @@ def analytics_congestion():
 
 
 # ---------------------------------------------------------------------------
-# Analytics – OD Patterns
+# Analytics – OD Patterns (from real fused trajectories)
 # ---------------------------------------------------------------------------
 @app.get("/analytics/od-patterns")
 def analytics_od_patterns():
@@ -181,6 +268,7 @@ class IngestBody(BaseModel):
     vehicle_bbox: Optional[str] = None
     plate_bbox: Optional[str] = None
     frame_number: Optional[int] = None
+    track_id: Optional[int] = None
 
 
 @app.post("/ingest")
@@ -190,8 +278,8 @@ def ingest(body: IngestBody):
         cur = conn.execute(
             "INSERT INTO sightings "
             "(plate, camera_id, gps_lat, gps_lon, timestamp, "
-            " plate_confidence, vehicle_class, vehicle_bbox, plate_bbox, frame_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " plate_confidence, vehicle_class, vehicle_bbox, plate_bbox, frame_number, track_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 body.plate,
                 body.camera_id,
@@ -203,6 +291,7 @@ def ingest(body: IngestBody):
                 body.vehicle_bbox,
                 body.plate_bbox,
                 body.frame_number,
+                body.track_id,
             ),
         )
         conn.commit()

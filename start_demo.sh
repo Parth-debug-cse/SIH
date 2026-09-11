@@ -126,6 +126,13 @@ for i in $(seq 1 30); do
     fi
 done
 
+# Start shared cross-camera fusion worker FIRST so that camera workers only
+# ever write sightings and a single fusion service turns them into
+# trajectories (no per-worker fusion state).
+log "Starting shared fusion worker..."
+PYTHONPATH="$SCRIPT_DIR" python3 -m src.fusion.worker --interval 3 --log-level INFO &
+PIDS+=($!)
+
 # Start camera workers
 for video in data/raw_videos/camera_*.mp4; do
     BASENAME=$(basename "$video")

@@ -6,7 +6,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
 
 from src.db.schema import init_db, get_connection, DB_PATH
-import time, json
+import time, json, sqlite3
 
 # Initialize fresh database
 test_db = "tests/test_anpr.db"
@@ -54,13 +54,14 @@ conn.execute(
 )
 conn.commit()
 
-# Query trajectory
+# Query trajectory (named access is robust to schema column order)
+conn.row_factory = sqlite3.Row
 traj = conn.execute("SELECT * FROM trajectories WHERE plate = ?", ("KA01AB1234",)).fetchone()
-print(f"[OK] Trajectory: plate={traj[1]} from {traj[2]} to {traj[3]}, num_sightings={traj[6]}")
-assert traj[1] == "KA01AB1234"
-assert traj[2] == "cam_1"
-assert traj[3] == "cam_3"
-assert traj[6] == 3
+print(f"[OK] Trajectory: plate={traj['plate']} from {traj['first_camera']} to {traj['last_camera']}, num_sightings={traj['num_sightings']}")
+assert traj["plate"] == "KA01AB1234"
+assert traj["first_camera"] == "cam_1"
+assert traj["last_camera"] == "cam_3"
+assert traj["num_sightings"] == 3
 
 conn.close()
 os.remove(test_db)

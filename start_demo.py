@@ -144,6 +144,53 @@ def start_backend(device):
     sys.exit(1)
 
 
+def start_fusion_worker():
+    """Start the shared cross-camera fusion worker process.
+
+    The fusion worker periodically consumes sightings from the shared
+    database and persists unified trajectories.  Camera workers do NOT keep
+    their own fusion state - this is the single logical fusion service.
+    """
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+
+    cmd = [
+        str(VENV_PYTHON), "-m", "src.fusion.worker",
+        "--interval", "3",
+        "--log-level", "INFO",
+    ]
+
+    log("Fusion", "Starting shared cross-camera fusion worker")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _child_processes.append(proc)
+    return proc
+
+
+def validate_camera_configs():
+    """Validate data/calibration/cameras.json; warn on missing calibration."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        from src.calibration import load_cameras_config, validate_cameras_config
+        cameras = load_cameras_config()
+        issues = validate_cameras_config(cameras)
+        errors = [m for m in issues if m.startswith("[ERROR]")]
+        warnings = [m for m in issues if m.startswith("[WARN]")]
+        for w in warnings:
+            log("Calibration", w.replace("[WARN] ", ""), "WARN")
+        for e in errors:
+            log("Calibration", e.replace("[ERROR] ", ""), "FAIL")
+        return not errors
+    except (FileNotFoundError, ValueError) as exc:
+        log("Calibration", f"Config cannot be read: {exc}", "FAIL")
+        return False
+
+
 def start_camera_workers(video_files, device, speed_factor):
     """Start one pipeline runner per camera video."""
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -263,12 +310,23 @@ def main():
     # 5. Start backend
     backend_proc = start_backend(device)
 
-    # 6. Start camera workers
+    # 6. Validate camera calibration
+    log("Startup", "Validating camera calibration...")
+    cal_ok = validate_camera_configs()
+    if not cal_ok:
+        log("Startup", "Camera calibration has errors. Cannot continue.", "FAIL")
+        cleanup()
+        sys.exit(1)
+
+    # 7. Start shared cross-camera fusion worker
+    fusion_proc = start_fusion_worker()
+
+    # 8. Start camera workers
     workers = start_camera_workers(video_files, device, args.speed_factor)
     for camera_id, proc in workers:
         log("Worker", f"{camera_id} running (pid={proc.pid})", "OK")
 
-    # 7. Print example commands
+    # 9. Print example commands
     print_example_commands()
 
     # 8. Wait for any process to exit

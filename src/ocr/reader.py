@@ -1,21 +1,39 @@
 """
-EasyOCR-based license plate reader with preprocessing and multi-frame voting.
+EasyOCR-based license plate reader with preprocessing and track-aware voting.
 
-Uses EasyOCR for text recognition with CLAHE contrast enhancement and
-majority voting across consecutive frames for stable plate readings.
+A plate reading is produced by EasyOCR + CLAHE preprocessing.  Multi-frame
+majority voting is **isolated per logical vehicle identity** - keyed by the
+caller-supplied ``track_key`` (normally ``(camera_id, track_id)``) - so that
+readings from different vehicles are never pooled into one vote.  Histories
+expire after a TTL and the set of tracked histories is bounded.
+
+Confidence semantics
+--------------------
+``read_plate()`` returns:
+
+* ``text``          - the voted (or most recent) plate string.
+* ``confidence``    - the confidence of exactly that string: the mean
+  EasyOCR confidence of the readings that produced the voted text.
+* ``raw_text`` / ``raw_confidence`` - the current single reading, so
+  callers can distinguish a raw read from an aggregated vote.
+* ``voted``         - True when the returned text came from a multi-reading
+  majority vote.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections import Counter
+import time
+from collections import Counter, deque
 from typing import Optional
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_KEY = ("__default__",)
 
 
 class PlateOCR:
@@ -24,7 +42,9 @@ class PlateOCR:
     Args:
         lang: Language for EasyOCR (default ``'en'``).
         use_gpu: Whether to run EasyOCR on GPU.
-        voting_window: Number of recent readings to consider for majority voting.
+        voting_window: Number of recent readings per track to consider.
+        history_ttl_seconds: Max age (s) of a track history before expiry.
+        max_track_histories: Bound on the number of live track histories.
     """
 
     def __init__(
@@ -32,12 +52,19 @@ class PlateOCR:
         lang: str = "en",
         use_gpu: bool = False,
         voting_window: int = 5,
+        history_ttl_seconds: float = 30.0,
+        max_track_histories: int = 256,
     ) -> None:
         self.lang = lang
         self.use_gpu = use_gpu
         self.voting_window = voting_window
+        self.history_ttl_seconds = history_ttl_seconds
+        self.max_track_histories = max_track_histories
         self._reader = None
-        self._history: list[str] = []
+        # track_key -> deque of (text, confidence, timestamp)
+        self._histories: dict[tuple, deque] = {}
+        # track_key -> last-access time (for LRU eviction)
+        self._last_access: dict[tuple, float] = {}
 
     @property
     def reader(self):
@@ -53,6 +80,10 @@ class PlateOCR:
                 "EasyOCR initialised (lang=%s, gpu=%s)", self.lang, self.use_gpu
             )
         return self._reader
+
+    # ------------------------------------------------------------------
+    # Preprocessing
+    # ------------------------------------------------------------------
 
     def preprocess_plate(self, plate_image: np.ndarray) -> np.ndarray:
         """Apply preprocessing to a plate crop.
@@ -117,8 +148,109 @@ class PlateOCR:
 
         return self._clean_plate_text(best_text), best_conf
 
-    def read_plate(self, plate_image: np.ndarray) -> dict:
-        """Run OCR on a single plate crop with majority voting."""
+    # ------------------------------------------------------------------
+    # Track-aware voting
+    # ------------------------------------------------------------------
+
+    def _expire_histories(self, now: float) -> None:
+        """Drop histories that have not been touched within the TTL."""
+        expired = [
+            key for key, last in self._last_access.items()
+            if now - last > self.history_ttl_seconds
+        ]
+        for key in expired:
+            self._histories.pop(key, None)
+            self._last_access.pop(key, None)
+
+        # Bound the number of live histories (stale tracks must not accumulate
+        # forever) by evicting the least-recently-used entries.
+        while len(self._histories) > self.max_track_histories:
+            oldest = min(self._last_access, key=self._last_access.get)
+            self._histories.pop(oldest, None)
+            self._last_access.pop(oldest, None)
+
+    def _history_for(self, track_key, now: float) -> deque:
+        key = tuple(track_key) if track_key is not None else _DEFAULT_KEY
+        hist = self._histories.get(key)
+        if hist is None:
+            hist = deque(maxlen=self.voting_window)
+            self._histories[key] = hist
+        self._last_access[key] = now
+        return hist
+
+    def record_vote(
+        self,
+        text: str,
+        confidence: float,
+        track_key=None,
+        now: Optional[float] = None,
+    ) -> dict:
+        """Record one reading for a track and return the current vote.
+
+        This is the single place where history is updated, so unit tests can
+        exercise voting without running EasyOCR.
+        """
+        now = time.time() if now is None else now
+        if not text:
+            return {"text": "", "confidence": 0.0, "raw_text": "", "raw_confidence": 0.0,
+                    "voted_count": 0, "voted": False}
+        hist = self._history_for(track_key, now)
+        # Expire AFTER the current key is (re)registered so the bound is
+        # respected exactly and the just-touched history is never evicted.
+        self._expire_histories(now)
+        hist.append((text, float(confidence)))
+
+        voted_text, voted_conf, count = self._aggregate(hist)
+        return {
+            "text": voted_text,
+            "confidence": voted_conf,
+            "raw_text": text,
+            "raw_confidence": float(confidence),
+            "voted_count": count,
+            "voted": count >= 2,
+        }
+
+    @staticmethod
+    def _aggregate(hist: deque) -> tuple[str, float, int]:
+        """Aggregate a track's readings into (text, confidence, vote size).
+
+        The text is the most frequent reading; confidence is the mean
+        confidence across the readings that produced that text.  With no
+        majority, the most recent reading (and its confidence) is returned.
+        """
+        if not hist:
+            return "", 0.0, 0
+
+        confs_by_text: dict[str, list[float]] = {}
+        for text, conf in hist:
+            confs_by_text.setdefault(text, []).append(conf)
+
+        most_common_text, confs = max(
+            confs_by_text.items(), key=lambda kv: (len(kv[1]), sum(kv[1]))
+        )
+        count = len(confs)
+        if count >= 2:
+            return most_common_text, float(sum(confs) / len(confs)), count
+        # No majority yet - return the most recent reading.
+        last_text, last_conf = hist[-1]
+        return last_text, float(last_conf), 1
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def read_plate(self, plate_image: np.ndarray, track_key=None) -> dict:
+        """Run OCR on a single plate crop with track-aware majority voting.
+
+        Args:
+            plate_image: BGR crop containing the plate.
+            track_key: logical vehicle identity (e.g. ``(camera_id, track_id)``).
+                Defaults to a shared key (legacy single-stream behaviour).
+
+        Returns:
+            Dict with ``text``/``confidence`` (matching each other) plus
+            ``raw_text``/``raw_confidence``/``voted``/``voted_count``.
+        """
         preprocessed = self.preprocess_plate(plate_image)
 
         try:
@@ -128,35 +260,34 @@ class PlateOCR:
             logger.exception("OCR inference failed")
             text, confidence = "", 0.0
 
-        if text:
-            self._history.append(text)
-            if len(self._history) > self.voting_window:
-                self._history = self._history[-self.voting_window:]
-            text = self._majority_vote()
+        if not text:
+            return {"text": "", "confidence": 0.0, "raw_text": "", "raw_confidence": 0.0,
+                    "voted_count": 0, "voted": False}
 
-        return {"text": text, "confidence": confidence}
+        return self.record_vote(text, confidence, track_key=track_key)
 
-    def read_plate_batch(self, plate_images: list[np.ndarray]) -> list[dict]:
-        """Run OCR on a batch of plate crops."""
+    def read_plate_batch(self, plate_images: list[np.ndarray], track_key=None) -> list[dict]:
+        """Run OCR on a batch of plate crops (shared track identity)."""
         results: list[dict] = []
         for img in plate_images:
             try:
-                results.append(self.read_plate(img))
+                results.append(self.read_plate(img, track_key=track_key))
             except Exception:
                 logger.exception("Batch OCR failed for one image")
-                results.append({"text": "", "confidence": 0.0})
+                results.append({"text": "", "confidence": 0.0, "raw_text": "",
+                                "raw_confidence": 0.0, "voted_count": 0, "voted": False})
         return results
 
-    def clear_history(self) -> None:
-        """Reset the multi-frame voting history."""
-        self._history.clear()
+    def clear_history(self, track_key=None) -> None:
+        """Reset voting history.
 
-    def _majority_vote(self) -> str:
-        """Return the most frequent plate string from recent history."""
-        if not self._history:
-            return ""
-        counter = Counter(self._history)
-        most_common_text, most_common_count = counter.most_common(1)[0]
-        if most_common_count >= 2:
-            return most_common_text
-        return self._history[-1]
+        With *track_key*: clear only that track's history.  Without it: clear
+        all track histories.
+        """
+        if track_key is None:
+            self._histories.clear()
+            self._last_access.clear()
+            return
+        key = tuple(track_key)
+        self._histories.pop(key, None)
+        self._last_access.pop(key, None)

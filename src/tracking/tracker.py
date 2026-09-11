@@ -1,20 +1,38 @@
+"""Per-camera vehicle tracking.
+
+Wraps **DeepSORT** (via the ``deep-sort-realtime`` package) to maintain
+temporal identities of vehicles within a single camera feed.
+"""
+
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 
 class VehicleTracker:
+    """DeepSORT-based per-camera tracker.
+
+    Args:
+        max_age: Frames a track survives without detections.
+        n_init: Frames a candidate must be detected before it is confirmed.
+    """
+
     def __init__(self, max_age=30, n_init=3):
         self.max_age = max_age
         self.n_init = n_init
+        # DeepSORT from deep-sort-realtime 1.3.x
         self.tracker = DeepSort(max_age=max_age, n_init=n_init)
 
     def update(self, detections, frame=None, frame_shape=None):
-        """Update tracker with new detections.
+        """Update the DeepSORT tracker with new detections.
 
         Args:
             detections: list of dicts with bbox, confidence, class_name
             frame: actual numpy frame (preferred for appearance features)
             frame_shape: (height, width) tuple as fallback
+
+        Returns:
+            List of confirmed tracks with ``track_id``, LTRB ``bbox``,
+            ``confidence`` and ``class_name``.
         """
         if not detections:
             return []
@@ -49,4 +67,5 @@ class VehicleTracker:
         return results
 
     def reset(self):
+        """Reset tracker state to a fresh DeepSORT instance."""
         self.tracker = DeepSort(max_age=self.max_age, n_init=self.n_init)

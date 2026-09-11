@@ -135,5 +135,5 @@ if __name__ == "__main__":
     total_veh = sum(v["vehicles_ge_60px_sampled"] for v in rep["per_video"])
     total_plates = sum(v["plates_confident_ge_0_50"] for v in rep["per_video"])
     print(f"Vehicles >=60px sampled (bounded): {total_veh}")
-    print(f"Confident plate reads (conf>=0.30): {total_plates}")
+    print(f"Confident plate reads (conf>=0.50 gate): {total_plates}")
     print(f"Plate strings: {[p for v in rep['per_video'] for p in v['plate_strings']]}")

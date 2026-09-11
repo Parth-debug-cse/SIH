@@ -53,6 +53,9 @@ for p in od:
 summary = analytics.get_analytics_summary()
 print(f"[OK] Analytics summary for {len(summary)} cameras")
 for cam_id, stats in summary.items():
-    print(f"  {cam_id}: total={stats['total_vehicles']}, speed={stats['avg_speed_kmh']:.1f} km/h")
+    # avg_speed is None (reported unavailable) when no calibration-backed
+    # speeds were measured for that camera.
+    speed_str = f"{stats['avg_speed_kmh']:.1f}" if stats["avg_speed_kmh"] is not None else "N/A"
+    print(f"  {cam_id}: total={stats['total_vehicles']}, speed={speed_str} km/h")
 
 print("SMOKE TEST 5.6 PASSED")

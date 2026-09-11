@@ -57,13 +57,13 @@
 
 ---
 
-### 5.3 — Per-Camera Tracking (DeepSORT/ByteTrack)
+### 5.3 — Per-Camera Tracking (DeepSORT)
 
 | Metric | Value |
 |--------|-------|
 | Command | `python tests/test_tracking.py` |
 | Result | PASSED |
-| Tracker | DeepSort via deep-sort-realtime 1.3.2 |
+| Tracker | DeepSort via deep-sort-realtime 1.3.2 (not ByteTrack) |
 | Embedder | MobileNetV2 (pretrained, CPU) |
 | Frames processed | 30 |
 | Unique track IDs | 1 |
@@ -84,6 +84,16 @@
 | Plate matches found | 3 (all pairs of same plate across cameras) |
 | Fused trajectories | 1 (all 3 sightings unified) |
 | Route order | cam_1 → cam_2 → cam_3 (correct chronological) |
+| Association scoring | `0.40·plate + 0.20·ocr + 0.30·spatiotemporal + 0.10·vehicle_attr`; hard rejects: edit distance > 2, non-positive elapsed time, speed > 150 km/h, same-camera/different-track, class conflict |
+| Ordering enforced | Reversed (negative) and zero elapsed times rejected; fusion always traverses chronologically |
+
+**New integration/unit suites (2nd audit):**
+
+| Suite | Command | Covered |
+|-------|---------|---------|
+| Fusion engine unit tests | `python tests/test_fusion_engine.py` | reversed order rejected, zero-time edge rejected, impossible travel (10+ km in 2 s) rejected, valid trip one ordered trajectory, speed estimate, transitive false-merge prevented (weak intermediate), same-camera/different-track rejected, chronological traversal of reverse-ordered input, `match_plates` preserved |
+| OCR track voting unit tests | `python tests/test_ocr_track_voting.py` | per-track isolation, voted confidence always matches voted text, history TTL expiry, LRU bound, `clear_history` scope |
+| E2E integration | `python tests/test_e2e_integration.py` | sightings seeded exactly as workers → shared fusion engine → `trajectories`/`trajectory_sightings` → API `/trajectory/{plate}`, `/analytics/od-patterns`, `/sightings`, `/alerts`, idempotent `POST /fusion/run` |
 
 ---
 
@@ -93,7 +103,7 @@
 |--------|-------|
 | Command | `python tests/test_db.py` |
 | Result | PASSED |
-| Database | SQLite, 4 tables (sightings, trajectories, alerts, analytics) |
+| Database | SQLite, 5 tables (sightings, trajectories, trajectory_sightings, alerts, analytics) + WAL mode + busy_timeout for multi-process access |
 | Sightings inserted | 3 |
 | Query for plate KA01AB1234 | 3 rows returned |
 | Route order verified | cam_1 → cam_2 → cam_3 |
@@ -111,9 +121,9 @@
 | Cameras configured | 3 |
 | Density (cam_1, 600s window) | 5.00 vehicles/frame |
 | Congestion level | high (total=100 in window) |
-| Speed estimate | 18.0 km/h |
+| Speed estimate | 18.0 km/h (pixel_to_meter_ratio from cameras.json) |
 | OD patterns | 2 patterns (cam_1→cam_2, cam_1→cam_3) |
-| Analytics summary | 3 cameras with vehicle counts and speed |
+| Analytics summary | 3 cameras; `avg_speed` reported as `None` ("N/A") when no calibration-backed speeds were measured — never a fabricated value |
 
 ---
 
@@ -143,8 +153,9 @@
 | `GET /analytics/congestion` | 200 | 1 camera with congestion data |
 | `GET /analytics/od-patterns` | 200 | 1 OD pattern |
 | `GET /alerts` | 200 | 1 alert |
-| `POST /ingest` | 200 | Sighting inserted, id returned |
+| `POST /ingest` | 200 | Sighting inserted, id returned (incl. `track_id`) |
 | `GET /sightings?plate=KA01AB1234` | 200 | 2 sightings filtered |
+| `POST /fusion/run` | 200 | Triggered shared fusion engine over current sightings (idempotent) |
 
 ---
 
@@ -156,7 +167,16 @@
 | Result | PASSED |
 | Frames processed | 30 |
 | Vehicles detected | Real footage: see below (synthetic video yields 0 by design) |
-| Pipeline stages executed | Detection → OCR → Tracking → Fusion → DB insert → Alert check → Analytics |
+| Pipeline stages executed | Detection → Tracking → OCR (track-aware voting) → DB insert → Alert check → Analytics → Fusion (end-of-run) |
+
+Camera workers do **not** run their own fusion: sightings (with `track_id` /
+`direction`) are persisted to the shared SQLite database, and the single
+shared fusion engine (`python -m src.fusion.worker --interval 3`, also
+triggered at end of each `PipelineRunner.run()` and via `POST /fusion/run`)
+consumes them and rebuilds `trajectories` + `trajectory_sightings` inside one
+immediate transaction. `start_demo.py` / `start_demo.sh` validate
+`data/calibration/cameras.json` and spawn the fusion worker between the
+backend and the camera workers.
 
 ---
 
@@ -237,6 +257,14 @@ python tests/test_db.py
 python tests/test_analytics.py
 python tests/test_alerts.py
 python tests/test_api.py
+
+# New integration / unit suites (2nd audit)
+python tests/test_fusion_engine.py
+python tests/test_ocr_track_voting.py
+python tests/test_e2e_integration.py
+
+# Seed demo data (sightings only, then triggers the real fusion engine)
+python tests/populate_test_data.py
 
 # Real-footage validation
 python tests/test_real_detection.py

@@ -142,33 +142,27 @@ class AlertEngine:
     ) -> dict:
         """Insert an alert row and return the resulting dict."""
         details = json.dumps({"matched_plate": matched_plate})
-        conn = schema.get_connection()
-        try:
-            cursor = conn.execute(
-                """
-                INSERT INTO alerts (plate, alert_type, camera_id, gps_lat, gps_lon, timestamp, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (plate, alert_type, camera_id, gps_lat, gps_lon, timestamp, details),
-            )
-            conn.commit()
-            alert_id = cursor.lastrowid
-            logger.info(
-                "Alert created: id=%s plate=%s type=%s", alert_id, plate, alert_type
-            )
-            return {
-                "id": alert_id,
-                "plate": plate,
-                "alert_type": alert_type,
-                "camera_id": camera_id,
-                "gps_lat": gps_lat,
-                "gps_lon": gps_lon,
-                "timestamp": timestamp,
-                "details": details,
-                "acknowledged": 0,
-            }
-        finally:
-            conn.close()
+        alert_id = schema.insert_row(
+            """
+            INSERT INTO alerts (plate, alert_type, camera_id, gps_lat, gps_lon, timestamp, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (plate, alert_type, camera_id, gps_lat, gps_lon, timestamp, details),
+        )
+        logger.info(
+            "[ALERT] created id=%s plate=%s type=%s", alert_id, plate, alert_type
+        )
+        return {
+            "id": alert_id,
+            "plate": plate,
+            "alert_type": alert_type,
+            "camera_id": camera_id,
+            "gps_lat": gps_lat,
+            "gps_lon": gps_lon,
+            "timestamp": timestamp,
+            "details": details,
+            "acknowledged": 0,
+        }
 
     # ------------------------------------------------------------------
     # Alert feed
