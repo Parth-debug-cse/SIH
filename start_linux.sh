@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ANPR Pipeline Go-Live starter (Linux).
-# Runs backend + shared fusion worker + one pipeline runner per video in
-# data/raw_videos/, then prints: vehicles detected, plates read, plate numbers.
+# Runs backend + fusion worker silently, then processes each video in
+# data/raw_videos/ IN THE FOREGROUND so results print live to the console,
+# then shows vehicles / plates / plate numbers from the database.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,27 +64,24 @@ done
 PYTHONPATH="$SCRIPT_DIR" "$PY" -m src.fusion.worker --interval 3 --log-level WARNING >/dev/null 2>&1 &
 PIDS+=($!)
 
-# --- camera workers --------------------------------------------------------
-CAM_PIDS=()
+# --- camera workers (FOREGROUND: results print live on screen) -------------
 n=0
 for video in "${VIDEOS[@]}"; do
     n=$((n+1))
     cam="cam_$n"
-    log "Processing: $cam <- $(basename "$video")"
+    echo
+    echo "========== PROCESSING: $cam <- $(basename "$video") =========="
     PYTHONPATH="$SCRIPT_DIR" "$PY" -m src.pipeline_runner \
         --camera-id "$cam" --video "$video" --gps-lat 12.9758 --gps-lon 77.6082 \
-        --device "$COMPUTE" --speed-factor 0.5 --log-level WARNING >/dev/null 2>&1 &
-    PIDS+=($!)
-    CAM_PIDS+=($!)
+        --device "$COMPUTE" --speed-factor 0 --log-level INFO || warn "Pipeline exit code $?"
 done
 
-# Wait for all camera workers to finish, then show results
-for pid in "${CAM_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
-sleep 1  # let fusion persist any final sightings
-
+# --- show live results -----------------------------------------------------
+sleep 1
 echo
 PYTHONPATH="$SCRIPT_DIR" "$PY" "$SCRIPT_DIR/scripts/plates_report.py"
 
 echo
-log "Done. Run 'python scripts/plates_report.py' again anytime to re-print results."
-echo "Press Ctrl+C to stop the backend/fusion services."
+log "Rerun report anytime: python scripts/plates_report.py"
+echo "Backend + fusion remain up. Press Ctrl+C to stop them."
+wait

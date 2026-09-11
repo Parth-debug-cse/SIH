@@ -1,6 +1,7 @@
 # ANPR Pipeline Go-Live starter (Windows PowerShell).
-# Runs backend + shared fusion worker + one pipeline runner per video in
-# data/raw_videos/, then prints: vehicles detected, plates read, plate numbers.
+# Runs backend + fusion worker silently, then processes each video in
+# data/raw_videos/ IN THE FOREGROUND so results print live to the console,
+# then shows vehicles / plates / plate numbers from the database.
 param([string]$Device = "cpu")
 
 $ErrorActionPreference = "Stop"
@@ -8,6 +9,7 @@ $SCRIPT_DIR = $PSScriptRoot
 Set-Location -LiteralPath $SCRIPT_DIR
 
 function Log($msg) { Write-Host "[OK] $msg" -ForegroundColor Green }
+function Warn($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
 function Fail($msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 }
 
 # --- python ---------------------------------------------------------------
@@ -43,27 +45,25 @@ for ($i = 1; $i -le 30; $i++) {
 }
 $fusion = Start-Process -FilePath $PY -ArgumentList @("-m", "src.fusion.worker", "--interval", "3", "--log-level", "WARNING") -PassThru -WindowStyle Hidden
 
-# --- camera workers --------------------------------------------------------
-$PROCS = @()
+# --- camera workers (FOREGROUND: results print live on screen) -------------
 $n = 0
 foreach ($video in $VIDEOS) {
     $n++
     $cam = "cam_$n"
-    Log "Processing: $cam <- $(Split-Path $video -Leaf)"
-    $w = Start-Process -FilePath $PY -ArgumentList @("-m", "src.pipeline_runner", "--camera-id", $cam, "--video", $video, "--gps-lat", "12.9758", "--gps-lon", "77.6082", "--device", $Device, "--speed-factor", "0.5", "--log-level", "WARNING") -PassThru -WindowStyle Hidden
-    $PROCS += $w
+    Write-Host ""
+    Write-Host "========== PROCESSING: $cam <- $(Split-Path $video -Leaf) =========="
+    & $PY -m src.pipeline_runner --camera-id $cam --video $video --gps-lat 12.9758 --gps-lon 77.6082 --device $Device --speed-factor 0 --log-level INFO
+    if ($LASTEXITCODE -ne 0) { Warn "Pipeline exit code $LASTEXITCODE" }
 }
 
-# Wait for all camera workers to finish, then show results
-foreach ($w in $PROCS) { $w.WaitForExit() }
-Start-Sleep -Seconds 1  # let fusion persist any final sightings
-
+# --- show live results -----------------------------------------------------
+Start-Sleep -Seconds 1
 Write-Host ""
 & $PY "$SCRIPT_DIR\scripts\plates_report.py"
 
 Write-Host ""
-Log "Done. Run 'python scripts\plates_report.py' again anytime to re-print results."
-Write-Host "Press Ctrl+C to stop the backend/fusion services."
+Log "Rerun report anytime: python scripts\plates_report.py"
+Write-Host "Backend + fusion remain up. Press Ctrl+C to stop them."
 
 # Keep backend + fusion alive until user stops them
 try { Wait-Process -Id @($backend.Id, $fusion.Id) -ErrorAction SilentlyContinue } catch {}
