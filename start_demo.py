@@ -122,8 +122,8 @@ def start_backend(device):
         cmd,
         cwd=str(PROJECT_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=None,
+        stderr=None,
     )
     _child_processes.append(proc)
 
@@ -165,8 +165,8 @@ def start_fusion_worker():
         cmd,
         cwd=str(PROJECT_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=None,
+        stderr=None,
     )
     _child_processes.append(proc)
     return proc
@@ -228,8 +228,8 @@ def start_camera_workers(video_files, device, speed_factor):
             cmd,
             cwd=str(PROJECT_ROOT),
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=None,
+            stderr=None,
         )
         _child_processes.append(proc)
         workers.append((camera_id, proc))

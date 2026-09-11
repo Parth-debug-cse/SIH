@@ -493,30 +493,44 @@ class CrossCameraFusion:
         sightings: list[dict[str, Any]] | None = None,
         max_gap_seconds: Optional[float] = None,
         min_association_score: Optional[float] = None,
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Group sightings into trajectories keyed by canonical plate text.
+    ) -> list[dict[str, Any]]:
+        """Group sightings into chronologically-fused trajectory objects.
 
         Strategy (trajectory-aware sequential association):
         1. Sightings are sorted by timestamp and consumed in order: each
            trajectory is grown forward from an unassigned seed.
-        2. A candidate is added only when the association from the current
+        2. Among the accepted, in-window candidates the *earliest* sighting is
+           chosen, so a route that visits intermediate cameras continuously is
+           preferred over skipping them for a higher-scoring distant match.
+        3. A candidate is added only when the association from the current
            tail is accepted *and* its plate is still within
            ``max_edit_distance`` of the trajectory's **canonical** (first)
            plate.  The canonical check prevents one weak intermediate match
            from chaining together two unrelated vehicles (union-find
            transitive-merge hazard).
-        3. Each finished chain is validated against the same association
+        4. Each finished chain is validated against the same association
            rules and split at any weak/invalid internal link.
 
-        Returns a dict ``{canonical_plate: [sighting, ...]}`` with each list
-        sorted chronologically.
+        Each returned trajectory is a dict with a **unique identity**, never
+        the canonical plate string::
+
+            {
+                "trajectory_id": "trajectory_0",
+                "canonical_plate": "KA01AB1234",
+                "sightings": [ {...}, ... ],   # ordered chronologically
+            }
+
+        Two chains that share a canonical plate but represent different
+        vehicles are kept as separate trajectories.  As a hard invariant, no
+        trajectory ever contains two sightings from the same camera with
+        different track IDs - even when their OCR plate strings are identical.
         """
         if sightings is None:
             sightings = self.sightings
 
         ordered = sorted(sightings, key=lambda s: self._epoch(s["timestamp"]))
         if not ordered:
-            return {}
+            return []
 
         window = max_gap_seconds if max_gap_seconds is not None else self.max_gap_seconds
         min_score = (
@@ -557,44 +571,101 @@ class CrossCameraFusion:
                     assoc = self.associate_sightings(tail, s)
                     if not assoc.accepted or assoc.association_score < min_score:
                         continue
-                    if best is None or (assoc.association_score, -s_ts) > (best[0].association_score, -best[1]):
+                    # Prefer the chronologically-earliest accepted candidate so
+                    # intermediate cameras are visited in order.
+                    if best is None or (s_ts, -assoc.association_score) < (best[1], -best[0].association_score):
                         best = (assoc, s_ts, j)
                 if best is None:
                     break
-                assoc, s_ts, j = best
+                _, _, j = best
                 chain.append(ordered[j])
                 available[j] = False
 
             chains.append(chain)
 
-        trajectories: dict[str, list[dict[str, Any]]] = {}
+        trajectories: list[dict[str, Any]] = []
         for chain in chains:
-            for piece in self._split_invalid_chain(chain):
+            for piece_raw in self._split_invalid_chain(chain):
+                piece = self._dedup_sightings(
+                    sorted(piece_raw, key=lambda s: self._epoch(s["timestamp"]))
+                )
                 if not piece:
                     continue
-                canon = str(piece[0]["plate"]).strip().upper()
-                trajectories.setdefault(canon, []).extend(piece)
-
-        for plate in trajectories:
-            trajectories[plate].sort(key=lambda s: self._epoch(s["timestamp"]))
-            # Remove exact-duplicate rows (same plate/camera/timestamp) as a
-            # defensive de-duplication step.
-            seen: set[tuple] = set()
-            dedup: list[dict[str, Any]] = []
-            for s in trajectories[plate]:
-                key = (
-                    str(s.get("plate", "")),
-                    str(s.get("camera_id", "")),
-                    round(self._epoch(s.get("timestamp", 0.0)), 6),
-                    s.get("track_id"),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                dedup.append(s)
-            trajectories[plate] = dedup
+                # Hard invariant: one trajectory must never mix two different
+                # track IDs on the same camera - regardless of plate text.
+                for sub in self._split_integrity_violations(piece):
+                    if not sub:
+                        continue
+                    canon = str(sub[0]["plate"]).strip().upper()
+                    trajectories.append(
+                        {
+                            "trajectory_id": f"trajectory_{len(trajectories)}",
+                            "canonical_plate": canon,
+                            "sightings": sub,
+                        }
+                    )
 
         return trajectories
+
+    def _dedup_sightings(self, sightings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop exact-duplicate rows (same plate/camera/timestamp/track)."""
+        seen: set[tuple] = set()
+        dedup: list[dict[str, Any]] = []
+        for s in sightings:
+            key = (
+                str(s.get("plate", "")),
+                str(s.get("camera_id", "")),
+                round(self._epoch(s.get("timestamp", 0.0)), 6),
+                s.get("track_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(s)
+        return dedup
+
+    def _split_integrity_violations(
+        self,
+        sightings: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        """Split a chain at any same-camera / different-track boundary.
+
+        Guarantees the invariant that a single trajectory never contains two
+        sightings from the same camera with different track IDs.  The rest of
+        the chain (e.g. a continuous cross-camera route) is preserved intact.
+        """
+        pieces: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        seen_track: dict = {}
+        for s in sightings:
+            cam = s.get("camera_id")
+            tid = s.get("track_id")
+            prev = seen_track.get(cam) if cam is not None else None
+            if cam is not None and tid is not None and prev is not None and prev != tid:
+                pieces.append(current)
+                current = [s]
+                seen_track = {cam: tid}
+                continue
+            if cam is not None and tid is not None:
+                seen_track[cam] = tid
+            current.append(s)
+        if current:
+            pieces.append(current)
+        return [p for p in pieces if p]
+
+    @staticmethod
+    def trajectory_violates_track_integrity(sightings: list[dict[str, Any]]) -> bool:
+        """True if a trajectory mixes two track IDs on the same camera."""
+        seen_track: dict = {}
+        for s in sightings:
+            cam = s.get("camera_id")
+            tid = s.get("track_id")
+            if cam is None or tid is None:
+                continue
+            if cam in seen_track and seen_track[cam] != tid:
+                return True
+            seen_track[cam] = tid
+        return False
 
     def _split_invalid_chain(
         self,

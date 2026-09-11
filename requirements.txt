@@ -1,14 +1,44 @@
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-easyocr>=1.7.0
-deep-sort-realtime>=1.3.0
-rapidfuzz>=3.0.0
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+# ANPR Pipeline — pinned build (matches VERIFICATION.md environment table).
+# Platform: Windows 11, Python 3.12, CPU-only.
+#
+# Install (docs-recommended, from project root):
+#   python -m venv .venv && .\.venv\Scripts\pip install -r requirements.txt
+#
+# torch / torchvision CPU wheels come from the PyTorch CPU index
+# (see DECISIONS.md item 16).  Symmetric CPU wheels are used so that the
+# verified environment is reproducible without a GPU.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ---------------------------------------------------------------------------
+# Core ML / detection
+# ---------------------------------------------------------------------------
+ultralytics==8.4.146
+opencv-python==5.0.0.93
+numpy==2.5.2
+scipy==1.18.1
+scikit-learn==1.9.0
+
+# ---------------------------------------------------------------------------
+# OCR
+# ---------------------------------------------------------------------------
+easyocr==1.7.2
+
+# ---------------------------------------------------------------------------
+# Tracking / ReID
+# ---------------------------------------------------------------------------
+deep-sort-realtime==1.3.2
+rapidfuzz==3.14.6
+
+# ---------------------------------------------------------------------------
+# Backend / API
+# ---------------------------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
 aiofiles>=23.0.0
-pydantic>=2.0.0
-scikit-learn>=1.3.0
-scipy>=1.11.0
-torch>=2.0.0
-torchvision>=0.15.0
+pydantic==2.13.5
+
+# ---------------------------------------------------------------------------
+# Deep learning runtime (CPU wheels from --extra-index-url above)
+# ---------------------------------------------------------------------------
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu

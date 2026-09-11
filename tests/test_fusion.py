@@ -44,10 +44,14 @@ for m in matches:
 # Test trajectory fusion
 trajectories = fusion.fuse_trajectories()
 print(f"[OK] Fused trajectories: {len(trajectories)}")
-for plate, sightings in trajectories.items():
-    cameras = [s["camera_id"] for s in sightings]
-    print(f"  Plate '{plate}': route = {' -> '.join(cameras)}")
-    assert len(sightings) == 3, f"FAIL: Expected 3 sightings, got {len(sightings)}"
-    assert cameras == ["cam_1", "cam_2", "cam_3"], f"FAIL: Route order wrong: {cameras}"
+assert len(trajectories) == 1, f"FAIL: expected 1 trajectory, got {len(trajectories)}"
+traj = trajectories[0]
+sightings = traj["sightings"]
+cameras = [s["camera_id"] for s in sightings]
+print(f"  '{traj['canonical_plate']}' ({traj['trajectory_id']}): route = {' -> '.join(cameras)}")
+assert traj["trajectory_id"] == "trajectory_0"
+assert traj["canonical_plate"] == "KA01AB1234"
+assert len(sightings) == 3, f"FAIL: Expected 3 sightings, got {len(sightings)}"
+assert cameras == ["cam_1", "cam_2", "cam_3"], f"FAIL: Route order wrong: {cameras}"
 
 print("SMOKE TEST 5.4 PASSED")

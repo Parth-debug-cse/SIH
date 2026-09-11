@@ -86,12 +86,17 @@ def _trajectory_stats(
 
 
 def store_trajectories(
-    trajectories: dict[str, list[dict[str, Any]]],
+    trajectories: list[dict[str, Any]],
     db_path: Optional[str | Path] = None,
     source: str = "fusion_engine",
     fusion: Optional[CrossCameraFusion] = None,
 ) -> int:
     """Replace trajectory tables with the output of the fusion engine.
+
+    Each element of *trajectories* is a trajectory object ("trajectory_id",
+    "canonical_plate", "sightings").  Every trajectory is stored as its own
+    row, so two trajectories that share a canonical plate but represent
+    different vehicles stay separate.
 
     Runs inside a single transaction (``BEGIN IMMEDIATE``) so that
     concurrent fusion runs are serialized safely.  Returns the number of
@@ -105,7 +110,8 @@ def store_trajectories(
 
         fusion = fusion or CrossCameraFusion()
         count = 0
-        for plate, sightings in trajectories.items():
+        for traj in trajectories:
+            sightings = traj.get("sightings") or []
             if not sightings:
                 continue
             stats = _trajectory_stats(sightings, fusion)
@@ -116,7 +122,7 @@ def store_trajectories(
                     total_duration_seconds, trajectory_confidence, source)
                    VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    plate,
+                    traj.get("canonical_plate") or sightings[0]["plate"],
                     stats["first_camera"],
                     stats["last_camera"],
                     stats["first_seen"],
@@ -204,20 +210,24 @@ def run_fusion_once(
     return {
         "num_sightings": len(sightings),
         "num_trajectories": count,
-        "trajectories": sorted(trajectories.keys()),
+        "trajectories": [t["canonical_plate"] for t in trajectories],
     }
 
 
 def _log_trajectories(
-    trajectories: dict[str, list[dict[str, Any]]],
+    trajectories: list[dict[str, Any]],
     fusion: CrossCameraFusion,
 ) -> None:
     """Emit observability events for accepted trajectories."""
-    for plate, sightings in trajectories.items():
+    for t in trajectories:
+        sightings = t.get("sightings") or []
+        if not sightings:
+            continue
         route = " -> ".join(s["camera_id"] for s in sightings)
         conf = _trajectory_stats(sightings, fusion)["trajectory_confidence"]
-        logger.info("[FUSION] accepted trajectory plate=%s route=%s sightings=%d conf=%.2f",
-                    plate, route, len(sightings), conf)
+        logger.info("[FUSION] accepted trajectory id=%s plate=%s route=%s sightings=%d conf=%.2f",
+                    t.get("trajectory_id", "?"), t.get("canonical_plate") or sightings[0]["plate"],
+                    route, len(sightings), conf)
 
 
 def run_fusion_loop(

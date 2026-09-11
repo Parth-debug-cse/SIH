@@ -88,24 +88,32 @@ else
 fi
 log "Device: $COMPUTE_DEVICE"
 
-# Init database
-python3 -c "
+# Database: explicit keep/reset semantics
+#   --keep-data : preserve an existing DB (init only if missing)
+#   (default)   : always reset - remove existing DB, then create fresh
+DB_PATH="data/anpr.db"
+DB_RESPECTED=0
+if [ -f "$DB_PATH" ]; then
+    if [ -n "$KEEP_DATA" ]; then
+        log "Keeping existing database: $DB_PATH"
+    else
+        rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"
+        log "Removed old database: $DB_PATH"
+    fi
+fi
+if [ ! -f "$DB_PATH" ]; then
+    log "Initializing fresh database..."
+    PYTHONPATH="$SCRIPT_DIR" python3 -c "
 import sys; sys.path.insert(0, '.')
 from src.db.schema import init_db
 init_db()
-print('[OK] Database initialized')
-" 2>/dev/null || python3 -c "
-import sys; sys.path.insert(0, '.')
-from src.db.schema import init_db
-from pathlib import Path
-db = Path('data/anpr.db')
-if db.exists() and '$KEEP_DATA' == '--keep-data':
-    print('[OK] Keeping existing database')
-else:
-    if db.exists(): db.unlink()
-    init_db()
-    print('[OK] Database initialized')
-"
+" 
+    if [ ! -f "$DB_PATH" ]; then
+        fail "Database init failed: $DB_PATH"
+        exit 1
+    fi
+    log "Database initialized: $DB_PATH"
+fi
 
 # Start backend
 log "Starting backend on :8000..."
