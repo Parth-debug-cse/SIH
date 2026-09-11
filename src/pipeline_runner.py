@@ -32,7 +32,7 @@ from src.detection.detector import (
     PlateDetector,
     resolve_plate_model_from_hub,
 )
-from src.ocr.reader import PlateOCR
+from src.ocr.reader import PlateOCR, looks_like_plate
 from src.tracking.tracker import VehicleTracker
 from src.alerts.engine import AlertEngine
 from src.db.schema import insert_row
@@ -86,12 +86,16 @@ class PipelineRunner:
         device: Optional[str] = None,
         min_ocr_confidence: float = 0.50,
         min_vehicle_height_px: int = 60,
+        plate_pad_ratio_x: float = 0.15,
+        plate_pad_ratio_y: float = 0.30,
     ) -> None:
         self.camera_id = camera_id
         self.video_path = Path(video_path)
         self.device = device
         self.min_ocr_confidence = min_ocr_confidence
         self.min_vehicle_height_px = min_vehicle_height_px
+        self.plate_pad_ratio_x = plate_pad_ratio_x
+        self.plate_pad_ratio_y = plate_pad_ratio_y
         self._cameras_config_path = DEFAULT_CAMERAS_PATH
 
         # Merge calibration (GPS, pixel_to_meter_ratio, compass_bearing) onto
@@ -152,7 +156,13 @@ class PipelineRunner:
             "no_plate_box_found": 0,
             "plate_found_below_gate": 0,
             "plate_crop_heights": [],
+            "plate_conf_cleared": 0,
+            "plate_confidence_cleared_format_rejected": 0,
+            "plate_format_rejected_samples": [],
             "plate_gate_cleared": 0,
+            "plate_aspect_ratio_rejected": 0,
+            "preprocess_calls": 0,
+            "preprocessed_crop_saved": None,
         }
 
     # ------------------------------------------------------------------
@@ -244,6 +254,23 @@ class PipelineRunner:
             cap.release()
             logger.info("Video capture released.")
 
+        # Post-run diagnostics: how many plate candidates the aspect-ratio
+        # filter rejected, how many times preprocessing actually ran, and the
+        # one preprocessed crop saved for manual inspection this run.
+        self._diag["plate_aspect_ratio_rejected"] = self.detector.plate_aspect_ratio_rejects
+        self._diag["preprocess_calls"] = self.ocr.preprocess_count
+        if self.ocr.last_preprocessed is not None:
+            out_dir = Path("data") / "debug_ocr"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            preprocessed_path = out_dir / f"preprocessed_{self.camera_id}.jpg"
+            cv2.imwrite(str(preprocessed_path), self.ocr.last_preprocessed)
+            self._diag["preprocessed_crop_saved"] = str(preprocessed_path)
+            logger.info(
+                "[OCR-PREPROCESS] saved preprocessed plate crop for manual "
+                "inspection: %s",
+                preprocessed_path,
+            )
+
         self._flush_analytics()
 
         if run_fusion:
@@ -274,7 +301,13 @@ class PipelineRunner:
             "no_plate_box_found": self._diag["no_plate_box_found"],
             "plate_found_below_gate": self._diag["plate_found_below_gate"],
             "plate_crop_heights_px": self._diag["plate_crop_heights"],
-            "plate_confidence_gate_cleared": self._diag["plate_gate_cleared"],
+            "plate_confidence_gate_cleared": self._diag["plate_conf_cleared"],
+            "plate_format_check_rejected": self._diag["plate_confidence_cleared_format_rejected"],
+            "plate_format_rejected_samples": self._diag["plate_format_rejected_samples"],
+            "plate_both_gates_cleared": self._diag["plate_gate_cleared"],
+            "plate_aspect_ratio_rejected": self._diag["plate_aspect_ratio_rejected"],
+            "preprocess_calls": self._diag["preprocess_calls"],
+            "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
         self._print_diagnostic_summary(summary)
         return summary
@@ -285,10 +318,13 @@ class PipelineRunner:
         heights: list[int] = d["plate_crop_heights"]
         attempted = d["vehicles_detected"] - d["vehicle_too_small"]
         plate_conf = self.detector.plate_conf_threshold
+        aspect_min, aspect_max = self.detector.plate_aspect_ratio_bounds
         agg = (
             f"{min(heights)} / {sum(heights)/len(heights):.1f} / {max(heights)}"
             if heights else "n/a"
         )
+        format_samples = d["plate_format_rejected_samples"]
+        sample_txt = ", ".join(f"'{s}'" for s in format_samples[:10]) or "none"
 
         lines = [
             "",
@@ -300,12 +336,18 @@ class PipelineRunner:
             f"  - too small to attempt     : {d['vehicle_too_small']}  (height < {self.min_vehicle_height_px}px)",
             f"  - attempted                : {attempted}",
             f"  - no plate box found       : {d['no_plate_box_found']}  (plate conf < {plate_conf})",
+            f"  - aspect-ratio rejected    : {d['plate_aspect_ratio_rejected']}  (outside {aspect_min:g}:1 - {aspect_max:g}:1)",
             f"  - plate box localized      : {d['vehicles_with_plate_box']}",
             f"Plate crop height (px)       : {heights}",
             f"  - min / avg / max          : {agg}",
             f"Plate found but below gate   : {d['plate_found_below_gate']}  (ocr conf < {self.min_ocr_confidence})",
-            f"Plate gate cleared           : {d['plate_gate_cleared']}  (ocr conf >= {self.min_ocr_confidence})",
+            f"Confidence gate cleared      : {d['plate_conf_cleared']}",
+            f"  - format check rejected    : {d['plate_confidence_cleared_format_rejected']}  (not an Indian plate)"
+            + (f"  e.g. {sample_txt}" if format_samples else ""),
+            f"Plate both gates cleared     : {d['plate_gate_cleared']}  (conf >= {self.min_ocr_confidence} AND plate format)",
             f"Plates read (sightings)      : {summary['plates_read']}",
+            f"Preprocessing calls          : {d['preprocess_calls']}",
+            f"Preprocessed crop saved      : {d['preprocessed_crop_saved'] or 'none'}",
             f"Alerts triggered             : {summary['alerts_triggered']}",
             "==================================",
         ]
@@ -435,14 +477,21 @@ class PipelineRunner:
 
         1. The dedicated plate model runs on the vehicle crop to find the
            plate box within the vehicle.
-        2. If no plate box clears the plate confidence threshold (0.25), OCR
+        2. Plate candidates outside the 2:1-5:1 aspect-ratio band are
+           rejected by the detector (no crop is made for them).
+        3. If no plate box clears the plate confidence threshold (0.25), OCR
            is skipped for that vehicle entirely (no heuristic fallback).
-        3. Otherwise the plate crop is preprocessed (grayscale -> CLAHE ->
-           3-4x upscale -> unsharp) and read by EasyOCR under its
-           ``(camera_id, track_id)`` voting identity.
+        4. Otherwise the plate box is padded (~15-20% width / ~30% height) so
+           leading state/series characters are not clipped, then the crop is
+           preprocessed (grayscale -> CLAHE -> 3-4x upscale -> unsharp) and
+           read by EasyOCR under its ``(camera_id, track_id)`` identity.
+        5. A sighting is written only when the read clears **both** gates:
+           ``ocr confidence >= min_ocr_confidence`` AND the text looks like an
+           Indian plate (``looks_like_plate``).
 
         Diagnostics distinguish *vehicle too small*, *no plate box found*,
-        *plate found but below confidence gate*, and *gate cleared*.
+        *below confidence gate*, *confidence cleared but format rejected*, and
+        *both gates cleared*.
         """
         h_max, w_max = frame.shape[:2]
         plate_entries: list[dict[str, Any]] = []
@@ -487,11 +536,24 @@ class PipelineRunner:
                 )
                 continue
 
-            crop_h = by2 - by1
-            crop_w = bx2 - bx1
+            raw_crop_w = bx2 - bx1
+            raw_crop_h = by2 - by1
+
+            # Padding margin around the detected plate box (~15-20% of width,
+            # ~30% of height) so leading state/series characters are not
+            # clipped out of the crop before OCR.
+            pad_x = int(raw_crop_w * self.plate_pad_ratio_x)
+            pad_y = int(raw_crop_h * self.plate_pad_ratio_y)
+            pbx1 = max(0, bx1 - pad_x)
+            pby1 = max(0, by1 - pad_y)
+            pbx2 = min(w_max, bx2 + pad_x)
+            pby2 = min(h_max, by2 + pad_y)
+
+            crop_w = pbx2 - pbx1
+            crop_h = pby2 - pby1
             self._diag["plate_crop_heights"].append(crop_h)
 
-            crop = frame[by1:by2, bx1:bx2]
+            crop = frame[pby1:pby2, pbx1:pbx2]
             if crop_w < 20 or crop_h < 10:
                 logger.debug(
                     "[OCR] %s frame=%d veh=%d plate crop too small (w=%d h=%d); skipping",
@@ -507,7 +569,7 @@ class PipelineRunner:
             conf = ocr_result["confidence"]
 
             entry = {
-                "bbox": [bx1, by1, bx2, by2],
+                "bbox": [pbx1, pby1, pbx2, pby2],
                 "confidence": best["confidence"],
                 "plate_text": text,
                 "ocr_confidence": conf,
@@ -534,7 +596,28 @@ class PipelineRunner:
                 self._diag["plate_found_below_gate"] += 1
                 continue
 
-            # Confident reading -> gate cleared -> sighting.
+            # First gate cleared: confidence.  Record it before the second
+            # (format) gate so "before vs after" is quantifiable.
+            self._diag["plate_conf_cleared"] += 1
+
+            # Second gate, alongside (not instead of) the confidence gate:
+            # the read must also look like an Indian plate string, otherwise
+            # branding/route-number boards such as "BMTC" would be written as
+            # sightings.  Both gates must pass for the sighting to be stored.
+            if not looks_like_plate(text):
+                logger.info(
+                    "[OCR] %s frame=%d veh=%d plate found but format check "
+                    "failed '%s' (conf=%.2f >= %.2f)",
+                    self.camera_id, frame_number, idx,
+                    text, conf, self.min_ocr_confidence,
+                )
+                self._diag["plate_confidence_cleared_format_rejected"] += 1
+                samples = self._diag["plate_format_rejected_samples"]
+                if len(samples) < 30:
+                    samples.append(text)
+                continue
+
+            # Confident + plate-shaped reading -> both gates cleared.
             read_count += 1
             self._diag["plate_gate_cleared"] += 1
             ts = datetime.now().timestamp()
@@ -552,7 +635,7 @@ class PipelineRunner:
                     "timestamp": ts,
                     "confidence": conf,
                     "vehicle_bbox": veh["bbox"],
-                    "plate_bbox": [bx1, by1, bx2, by2],
+                    "plate_bbox": [pbx1, pby1, pbx2, pby2],
                     "frame_number": frame_number,
                     "track_id": track_id,
                     "direction": self.direction,

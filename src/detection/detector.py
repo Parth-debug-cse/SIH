@@ -72,6 +72,8 @@ class PlateDetector:
         plate_conf_threshold: float = 0.25,
         vehicle_iou_threshold: float = 0.45,
         plate_iou_threshold: float = 0.45,
+        min_plate_aspect_ratio: float = 2.0,
+        max_plate_aspect_ratio: float = 5.0,
     ) -> None:
         """Initialise detector and load models.
 
@@ -95,11 +97,19 @@ class PlateDetector:
             IoU threshold for NMS on vehicle detections.
         plate_iou_threshold:
             IoU threshold for NMS on plate detections.
+        min_plate_aspect_ratio / max_plate_aspect_ratio:
+            Aspect-ratio (width:height) bounds for plate boxes.  Candidate
+            boxes from the plate model outside these bounds are rejected as
+            non-plate regions (e.g. bus branding / route-number boards) before
+            any crop is made for OCR.  Real Indian plates are ~2:1 to 5:1.
         """
         self._vehicle_conf = vehicle_conf_threshold
         self._plate_conf = plate_conf_threshold
         self._vehicle_iou = vehicle_iou_threshold
         self._plate_iou = plate_iou_threshold
+        self._plate_aspect_min = max(float(min_plate_aspect_ratio), 0.0)
+        self._plate_aspect_max = max(float(max_plate_aspect_ratio), self._plate_aspect_min)
+        self._aspect_reject_count: int = 0
 
         # ------------------------------------------------------------------
         # Resolve device
@@ -133,6 +143,20 @@ class PlateDetector:
     def plate_conf_threshold(self) -> float:
         """Minimum confidence for a plate detection (the "plate box" gate)."""
         return self._plate_conf
+
+    @property
+    def plate_aspect_ratio_bounds(self) -> tuple[float, float]:
+        """Valid width:height range for plate boxes (``(min, max)``)."""
+        return self._plate_aspect_min, self._plate_aspect_max
+
+    @property
+    def plate_aspect_ratio_rejects(self) -> int:
+        """Number of plate candidates rejected by the aspect-ratio pre-filter."""
+        return self._aspect_reject_count
+
+    def reset_plate_aspect_ratio_counter(self) -> None:
+        """Zero the per-run aspect-ratio rejection counter."""
+        self._aspect_reject_count = 0
 
     def detect_vehicles(self, frame: np.ndarray) -> list[dict]:
         """Detect vehicles in *frame*.
@@ -313,7 +337,13 @@ class PlateDetector:
     # ------------------------------------------------------------------
 
     def _detect_plates_model(self, frame: np.ndarray) -> list[dict]:
-        """Run the plate YOLO model on *frame*."""
+        """Run the plate YOLO model on *frame*.
+
+        Output boxes are pre-filtered by aspect ratio (width:height in the
+        configured bounds) before being returned, so non-plate rectangular
+        regions such as bus branding or route-number boards are rejected
+        before any crop is made for OCR.
+        """
         assert self._plate_model is not None
         t0 = time.perf_counter()
         results = self._plate_model.predict(
@@ -334,9 +364,22 @@ class PlateDetector:
             for i in range(len(boxes)):
                 xyxy = boxes.xyxy[i].cpu().numpy().astype(float).tolist()
                 conf = float(boxes.conf[i].item())
+                x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+                w, h = x2 - x1, y2 - y1
+                if h <= 0:
+                    continue
+                aspect = w / h
+                if aspect < self._plate_aspect_min or aspect > self._plate_aspect_max:
+                    self._aspect_reject_count += 1
+                    logger.debug(
+                        "Plate candidate rejected by aspect-ratio filter "
+                        "(w:%d h:%d ratio=%.2f outside %.2f-%.2f)",
+                        w, h, aspect, self._plate_aspect_min, self._plate_aspect_max,
+                    )
+                    continue
                 detections.append(
                     {
-                        "bbox": [int(round(v)) for v in xyxy],
+                        "bbox": [x1, y1, x2, y2],
                         "confidence": conf,
                         "plate_text": "",
                         "vehicle_idx": -1,

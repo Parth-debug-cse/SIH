@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_KEY = ("__default__",)
 
+# Permissive Indian plate grammar: two-letter state code, 1-2 digit district
+# number, optional 0-3 letter series, then the 3-4 digit unique number.
+# Examples that match: KA01AB1234, MH12CD5678, DL01EF9012, TN09ABX1234.
+PLATE_PATTERN = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{3,4}$")
+
+
+def looks_like_plate(text: str) -> bool:
+    """Permissive check that *text* is a plausible Indian plate string.
+
+    Whitespace is ignored and the input is upper-cased before matching, so
+    fragments such as ``"KA 15 F 1502"`` still validate.  Region names/branding
+    (``"BMTC"``, ``"BENGALURU"``) and bare digit runs (``"1502"``) do not.
+    """
+    if not text:
+        return False
+    return bool(PLATE_PATTERN.match(text.replace(" ", "").upper()))
+
 
 class PlateOCR:
     """License plate OCR engine with preprocessing and multi-frame voting.
@@ -65,6 +82,10 @@ class PlateOCR:
         self._histories: dict[tuple, deque] = {}
         # track_key -> last-access time (for LRU eviction)
         self._last_access: dict[tuple, float] = {}
+        # Observability for the preprocessing stage (fix: was defined but
+        # unverifiable in the real path).
+        self.preprocess_count: int = 0
+        self.last_preprocessed: Optional[np.ndarray] = None
 
     @property
     def reader(self):
@@ -146,7 +167,19 @@ class PlateOCR:
             upscaled, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0.0
         )
 
-        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+        result = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+        # Observability: log every call so the preprocess stage is provably
+        # exercised in the live detection -> OCR path, and stash the output
+        # (the caller may save one crop per run for manual inspection).
+        logger.debug(
+            "[PREPROCESS] plate crop preprocessed (%dx%d -> %dx%d)",
+            w, h, target_w, target_h,
+        )
+        self.preprocess_count += 1
+        self.last_preprocessed = result
+
+        return result
 
     @staticmethod
     def _clean_plate_text(text: str) -> str:
