@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ANPR Pipeline Go-Live starter (Linux).
-# Starts backend + shared fusion worker + one pipeline runner per video found
-# in data/raw_videos/ (any .mp4).  Nothing else is touched or renamed.
+# Runs backend + shared fusion worker + one pipeline runner per video in
+# data/raw_videos/, then prints: vehicles detected, plates read, plate numbers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,10 +14,8 @@ fail() { echo -e "${RED}[X]${NC} $1"; }
 
 PIDS=()
 cleanup() {
-    log "Stopping all processes..."
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
     wait 2>/dev/null || true
-    log "Stopped."
 }
 trap cleanup EXIT INT TERM
 
@@ -30,7 +28,6 @@ else
     fail "No python found. Create your venv: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
     exit 1
 fi
-log "Python: $PY"
 
 # --- model ----------------------------------------------------------------
 if [ ! -f "models/detection/yolov8n.pt" ]; then
@@ -39,7 +36,7 @@ if [ ! -f "models/detection/yolov8n.pt" ]; then
     fi
 fi
 
-# --- videos: auto-discover, assign cam_1, cam_2, ... in sorted order -------
+# --- videos ---------------------------------------------------------------
 VIDEOS=()
 while IFS= read -r -d '' f; do VIDEOS+=("$f"); done < <(find data/raw_videos -maxdepth 1 -type f \( -name '*.mp4' -o -name '*.MOV' \) -print0 | sort -z)
 if [ "${#VIDEOS[@]}" -eq 0 ]; then
@@ -47,50 +44,46 @@ if [ "${#VIDEOS[@]}" -eq 0 ]; then
 fi
 log "Found ${#VIDEOS[@]} video(s)"
 
-# --- DB: reset data/anpr.db, then init -----------------------------------
+# --- DB -------------------------------------------------------------------
 rm -f data/anpr.db data/anpr.db-wal data/anpr.db-shm
 PYTHONPATH="$SCRIPT_DIR" "$PY" -c "from src.db.schema import init_db; init_db()"
 log "Database initialized: data/anpr.db"
 
 # --- device ---------------------------------------------------------------
-[ $# -gt 0 ] && DEVICE="$1" # optional arg: cpu | cuda:0
-COMPUTE="${DEVICE:-cpu}"
+COMPUTE="${1:-cpu}"
 
-# --- backend --------------------------------------------------------------
-log "Starting backend on :8000..."
-PYTHONPATH="$SCRIPT_DIR" "$PY" -m uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --log-level info >/dev/null 2>&1 &
+# --- backend + fusion (silent, needed for trajectories) ---------------------
+PYTHONPATH="$SCRIPT_DIR" "$PY" -m uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --log-level warning >/dev/null 2>&1 &
 PIDS+=($!)
 for i in $(seq 1 30); do
     sleep 1
-    if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then log "Backend ready"; break; fi
-    [ "$i" -eq 30 ] && { fail "Backend failed to start in 30s"; exit 1; }
+    curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1 && break
 done
 
-# --- fusion worker ---------------------------------------------------------
-log "Starting shared fusion worker..."
-PYTHONPATH="$SCRIPT_DIR" "$PY" -m src.fusion.worker --interval 3 --log-level INFO >/dev/null 2>&1 &
+PYTHONPATH="$SCRIPT_DIR" "$PY" -m src.fusion.worker --interval 3 --log-level WARNING >/dev/null 2>&1 &
 PIDS+=($!)
 
 # --- camera workers --------------------------------------------------------
+CAM_PIDS=()
 n=0
 for video in "${VIDEOS[@]}"; do
     n=$((n+1))
     cam="cam_$n"
-    log "Starting worker: $cam -> $(basename "$video")"
+    log "Processing: $cam <- $(basename "$video")"
     PYTHONPATH="$SCRIPT_DIR" "$PY" -m src.pipeline_runner \
         --camera-id "$cam" --video "$video" --gps-lat 12.9758 --gps-lon 77.6082 \
-        --device "$COMPUTE" --speed-factor 0.5 --log-level INFO >/dev/null 2>&1 &
+        --device "$COMPUTE" --speed-factor 0.5 --log-level WARNING >/dev/null 2>&1 &
     PIDS+=($!)
+    CAM_PIDS+=($!)
 done
 
+# Wait for all camera workers to finish, then show results
+for pid in "${CAM_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+sleep 1  # let fusion persist any final sightings
+
 echo
-echo "============================================"
-echo "  ANPR PIPELINE IS LIVE"
-echo "============================================"
-echo "  Health:     curl http://localhost:8000/health"
-echo "  Trajectory: curl http://localhost:8000/trajectory/KA01AB1234"
-echo "  Sightings:  curl http://localhost:8000/sightings"
-echo "  Alerts:     curl http://localhost:8000/alerts"
-echo "  Ctrl+C to stop."
-echo "============================================"
-wait
+PYTHONPATH="$SCRIPT_DIR" "$PY" "$SCRIPT_DIR/scripts/plates_report.py"
+
+echo
+log "Done. Run 'python scripts/plates_report.py' again anytime to re-print results."
+echo "Press Ctrl+C to stop the backend/fusion services."
