@@ -40,6 +40,147 @@ _DEFAULT_KEY = ("__default__",)
 # Examples that match: KA01AB1234, MH12CD5678, DL01EF9012, TN09ABX1234.
 PLATE_PATTERN = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{3,4}$")
 
+# Common EasyOCR character confusions for automotive glyphs.  Used only to
+# legalise a near-miss string against the Indian plate grammar - the raw OCR
+# read is never mutated unless it then matches the exact plate format.
+PLATE_CONFUSIONS: dict[str, tuple[str, ...]] = {
+    "O": ("0",), "D": ("0",), "Q": ("0",),
+    "I": ("1",), "L": ("1",), "B": ("8",),
+    "S": ("5",), "Z": ("2",), "G": ("6",),
+    "0": ("O",), "1": ("I",), "5": ("S",),
+    "8": ("B",), "2": ("Z",), "6": ("G",),
+}
+
+# Restrict EasyOCR to glyphs that can appear on an Indian plate.  Without an
+# allowlist EasyOCR spends probability mass on punctuation/symbols and the
+# confidence of the registration line is dragged down.
+OCR_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+# Digit that may legally appear in a LETTER segment (and its fix), and
+# vice versa.  Derived from PLATE_CONFUSIONS — no invented mappings.
+_DIGIT_TO_LETTER: dict[str, str] = {
+    "0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G",
+}
+_LETTER_TO_DIGIT: dict[str, str] = {
+    "O": "0", "D": "0", "Q": "0",
+    "I": "1", "L": "1", "B": "8",
+    "S": "5", "Z": "2", "G": "6",
+}
+
+
+def position_correct(text: str) -> str:
+    """Position-aware confusion fix using the Indian plate layout.
+
+    Layout: 2 state LETTERS + 1-2 district DIGITS + 0-3 series LETTERS +
+    3-4 registration DIGITS.  A character that violates its segment's
+    class (e.g. ``O`` inside the digit block) is mapped to the matching
+    class; characters already in-class are never touched — unlike a
+    global replace-all, this cannot corrupt correct characters.
+
+    Every valid (district_len, series_len, number_len) split is tried in
+    fixed order; the first split needing a mapped fix and yielding a
+    string that matches the plate grammar is returned.  If no split
+    works, the input is returned unchanged (never a hallucinated value).
+    """
+    s = re.sub(r"[^A-Z0-9]", "", text.upper())
+    if looks_like_plate(s):
+        return s
+    n = len(s)
+    best: str | None = None
+    best_changes = 10 ** 9
+    for dd in (1, 2):
+        for se in (0, 1, 2, 3):
+            for nu in (3, 4):
+                if 2 + dd + se + nu != n:
+                    continue
+                parts = [s[0:2], s[2:2 + dd], s[2 + dd:2 + dd + se], s[2 + dd + se:]]
+                fixed: list[str] = []
+                changes = 0
+                ok = True
+                for seg_idx, seg in enumerate(parts):
+                    want_digit = seg_idx in (1, 3)
+                    for ch in seg:
+                        if want_digit and ch.isalpha():
+                            rep = _LETTER_TO_DIGIT.get(ch)
+                            if rep is None:
+                                ok = False
+                                break
+                            fixed.append(rep)
+                            changes += 1
+                        elif not want_digit and ch.isdigit():
+                            rep = _DIGIT_TO_LETTER.get(ch)
+                            if rep is None:
+                                ok = False
+                                break
+                            fixed.append(rep)
+                            changes += 1
+                        else:
+                            fixed.append(ch)
+                    if not ok:
+                        break
+                if not ok or changes == 0 or changes >= best_changes:
+                    continue
+                candidate = "".join(fixed)
+                if looks_like_plate(candidate):
+                    best, best_changes = candidate, changes
+    return best if best is not None else s
+
+
+def fuse_track_observations(obs: list[tuple[str, float]]) -> dict:
+    """Fuse one track's OCR observations into a canonical plate.
+
+    Steps: normalize -> keep plate-shaped readings if any -> group by
+    length (only structurally compatible strings vote together) ->
+    per-position confidence-weighted vote.  Falls back to the
+    whole-string (count, summed-confidence) winner when no position
+    consensus is possible.  Returns ``canonical_plate``,
+    ``aggregate_confidence``, ``observation_count`` and ``method``.
+    """
+    norm = [(re.sub(r"[^A-Z0-9]", "", t.upper()), float(c)) for t, c in obs if t]
+    norm = [(t, c) for t, c in norm if t]
+    if not norm:
+        return {"canonical_plate": "", "aggregate_confidence": 0.0,
+                "observation_count": 0, "method": "empty"}
+    shaped = [(t, c) for t, c in norm if looks_like_plate(t)]
+    pool = shaped if shaped else norm
+    by_len: dict[int, list[tuple[str, float]]] = {}
+    for t, c in pool:
+        by_len.setdefault(len(t), []).append((t, c))
+    # Largest group wins; tie-break by summed confidence (deterministic).
+    group = max(by_len.values(), key=lambda g: (len(g), sum(c for _, c in g)))
+    if len(group) == 1:
+        t, c = group[0]
+        return {"canonical_plate": t, "aggregate_confidence": c,
+                "observation_count": 1, "method": "single"}
+    L = len(group[0][0])
+    winners: list[str] = []
+    pos_scores: list[float] = []
+    for i in range(L):
+        weights: dict[str, float] = {}
+        total = 0.0
+        for t, c in group:
+            weights[t[i]] = weights.get(t[i], 0.0) + c
+            total += c
+        ch, w = max(weights.items(), key=lambda kv: (kv[1], kv[0]))
+        winners.append(ch)
+        pos_scores.append(w / total if total > 0 else 0.0)
+    canonical = "".join(winners)
+    mean_conf = sum(c for _, c in group) / len(group)
+    consistency = sum(pos_scores) / len(pos_scores)
+    if pool is shaped and not looks_like_plate(canonical):
+        # Position vote produced a non-plate: fall back to whole-string winner.
+        best, confs = max(
+            {t: [c for tt, c in group if tt == t] for t, _ in group}.items(),
+            key=lambda kv: (len(kv[1]), sum(kv[1])),
+        )
+        return {"canonical_plate": best,
+                "aggregate_confidence": sum(confs) / len(confs),
+                "observation_count": len(group), "method": "whole_string_fallback"}
+    return {"canonical_plate": canonical,
+            "aggregate_confidence": round(mean_conf * consistency, 4),
+            "observation_count": len(group), "method": "per_position_weighted"}
+
 
 def looks_like_plate(text: str) -> bool:
     """Permissive check that *text* is a plausible Indian plate string.
@@ -189,24 +330,126 @@ class PlateOCR:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+    def _normalize_confusions(self, text: str) -> str:
+        """Attempt bounded character substitutions to legalise a near-miss.
+
+        Each position is tried against ``PLATE_CONFUSIONS``; the first variant
+        that matches the Indian plate grammar is returned.  If none matches,
+        the original text is returned unchanged — no hallucinated values are
+        added.
+        """
+        upper = text.upper()
+        if looks_like_plate(upper):
+            return upper
+        for i, ch in enumerate(upper):
+            for rep in PLATE_CONFUSIONS.get(ch, ()):
+                candidate = upper[:i] + rep + upper[i + 1:]
+                if looks_like_plate(candidate):
+                    return candidate
+        return upper
+
+    @staticmethod
+    def _row_candidate_score(text: str, conf: float) -> tuple[float, float]:
+        """Return (score, conf) for a candidate plate string.
+
+        The score ranks candidates; conf is the raw OCR value that gates the
+        pipeline.  ``looks_like_plate`` gets a large bonus but conf is *never*
+        artificially inflated — the anti-hallucination gate still applies.
+        """
+        n_digits = sum(ch.isdigit() for ch in text)
+        n_alpha = sum(ch.isalpha() for ch in text)
+        if looks_like_plate(text):
+            return conf + 1.0, conf
+        if n_alpha >= 1 and n_digits >= 1 and 5 <= len(text) <= 11:
+            return conf + 0.30, conf
+        if n_alpha >= 1 and 5 <= len(text) <= 11:
+            return conf + 0.05, conf
+        return conf, conf
+
     def _extract_text(self, ocr_result: list) -> tuple[str, float]:
-        """Pull the best text + confidence from an EasyOCR result list."""
+        """Select the best plate string from one OCR pass.
+
+        Multi-row assembly: bus/truck plates have the state/brand on a top
+        row and the registration number below.  EasyOCR boxes both rows as
+        independent detections.  We group boxes into rows by y-centre
+        proximity, then assemble row-texts top-down and bottom-up to recover
+        the full plate string before running the format/confusion pass.
+        """
         if not ocr_result:
             return "", 0.0
 
-        best_text = ""
-        best_conf = 0.0
-
+        # 1. Collect boxes with geometric info
+        boxes: list[dict] = []
         for item in ocr_result:
             if item is None or len(item) < 3:
                 continue
-            text = str(item[1])
-            conf = float(item[2])
-            if conf > best_conf:
-                best_conf = conf
-                best_text = text
+            text = self._clean_plate_text(str(item[1]))
+            if not text:
+                continue
+            pts = item[0]
+            ys = [p[1] for p in pts]
+            xs = [p[0] for p in pts]
+            cy = sum(ys) / len(ys)
+            h = max(ys) - min(ys) or 1.0
+            boxes.append({
+                "text": text,
+                "conf": float(item[2]),
+                "cy": cy,
+                "cx": sum(xs) / len(xs),
+                "h": h,
+            })
 
-        return self._clean_plate_text(best_text), best_conf
+        if not boxes:
+            return "", 0.0
+
+        # 2. Group into horizontal rows (within ~18 px on the 3×-upscaled image)
+        boxes.sort(key=lambda b: b["cy"])
+        rows: list[list[dict]] = []
+        for b in boxes:
+            if rows and abs(b["cy"] - rows[-1][-1]["cy"]) <= max(18.0, 0.5 * (rows[-1][-1]["h"] + b["h"])):
+                rows[-1].append(b)
+            else:
+                rows.append([b])
+        for r in rows:
+            r.sort(key=lambda b: b["cx"])
+
+        # 3. Build candidates: each row alone + assembled top-down / bottom-up
+        candidates: list[tuple[float, float, str]] = []
+
+        def _add(text: str, conf: float) -> None:
+            norm = self._normalize_confusions(text)
+            score, _ = self._row_candidate_score(norm, conf)
+            candidates.append((score, conf, norm))
+            logger.debug(
+                "OCR candidate text='%s' conf=%.2f score=%.2f", norm, conf, score,
+            )
+            # Position-aware layout fix as an *additional* candidate: it can
+            # only add a plate-shaped variant, never remove or mutate `norm`.
+            pos = position_correct(text)
+            if pos != norm:
+                pscore, _ = self._row_candidate_score(pos, conf)
+                candidates.append((pscore, conf, pos))
+                logger.debug(
+                    "OCR candidate text='%s' conf=%.2f score=%.2f", pos, conf, pscore,
+                )
+
+        for row in rows:
+            row_text = "".join(b["text"] for b in row)
+            row_conf = sum(b["conf"] for b in row) / len(row)
+            _add(row_text, row_conf)
+
+        if len(rows) >= 2:
+            agg_conf = sum(b["conf"] for b in boxes) / len(boxes)
+            full_tb = "".join("".join(b["text"] for b in r) for r in rows)
+            full_bt = "".join("".join(b["text"] for b in r) for r in reversed(rows))
+            _add(full_tb, agg_conf)
+            _add(full_bt, agg_conf)
+
+        if not candidates:
+            return "", 0.0
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        return candidates[0][2], candidates[0][1]
 
     # ------------------------------------------------------------------
     # Track-aware voting
@@ -314,7 +557,9 @@ class PlateOCR:
         preprocessed = self.preprocess_plate(plate_image)
 
         try:
-            ocr_result = self.reader.readtext(preprocessed)
+            ocr_result = self.reader.readtext(
+                preprocessed, allowlist=OCR_ALLOWLIST,
+            )
             text, confidence = self._extract_text(ocr_result)
         except Exception:
             logger.exception("OCR inference failed")

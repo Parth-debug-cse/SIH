@@ -31,6 +31,53 @@ HF_PLATE_MODEL_REPO_ID = "Koushim/yolov8-license-plate-detection"
 HF_PLATE_MODEL_FILENAME = "best.pt"
 
 
+def _stabilize_pt_path(downloaded: Path, filename: str) -> Path:
+    """Return a stable ``.pt`` model path for a Hugging Face download.
+
+    ``hf_hub_download`` without ``local_dir`` returns a content-addressed
+    blob path (``.../blobs/<hash>``) with no file extension, which
+    Ultralytics rejects (``TypeError: model='.../blobs/...' is not a
+    supported model format``).  The real filename only exists under the
+    snapshot directory (``.../snapshots/<rev>/<filename>``).
+
+    Resolution order:
+    1. If *downloaded* already ends in ``.pt`` and is non-empty, use it.
+    2. Otherwise search sibling ``snapshots/*/<filename>`` directories.
+    3. Otherwise copy the blob bytes to
+       ``models/detection/<filename>`` under the project root so the
+       returned path deterministically ends in ``.pt``.
+    """
+    import hashlib
+
+    if downloaded.suffix == ".pt" and downloaded.is_file() and downloaded.stat().st_size > 0:
+        size = downloaded.stat().st_size
+        logger.info("Plate weights already a .pt file: %s (%d bytes)", downloaded, size)
+        return downloaded
+
+    # 2. Snapshot sibling: <hub>/models--<...>/snapshots/<rev>/<filename>.
+    # Blob layout: .../models--X/blobs/<hash>; snapshots live at .../models--X/snapshots/.
+    if len(downloaded.parts) >= 3 and downloaded.parent.name == "blobs":
+        hub_dir = downloaded.parent.parent
+        for cand in sorted((hub_dir / "snapshots").glob(f"*/{filename}")):
+            if cand.is_file() and cand.stat().st_size > 0:
+                logger.info("Resolved snapshot weights: %s (%d bytes)", cand, cand.stat().st_size)
+                return cand
+
+    # 3. Deterministic copy into the project models directory.
+    src_dir = Path(__file__).resolve().parent          # src/detection/
+    project_root = src_dir.parent.parent               # anpr-pipeline/
+    dest = project_root / "models" / "detection" / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data = downloaded.read_bytes()
+    if not data:
+        raise RuntimeError(f"Downloaded weights are empty: {downloaded}")
+    dest.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()[:16]
+    logger.info("Copied plate weights to stable path: %s (%d bytes, sha256:%s)",
+                dest, len(data), sha)
+    return dest
+
+
 def resolve_plate_model_from_hub(
     repo_id: str = HF_PLATE_MODEL_REPO_ID,
     filename: str = HF_PLATE_MODEL_FILENAME,
@@ -38,7 +85,9 @@ def resolve_plate_model_from_hub(
     """Download (or fetch cached) plate-detection weights from Hugging Face.
 
     Uses ``huggingface_hub.hf_hub_download`` so the weights are cached by hub
-    and only fetched once.  Returns the local path to the weights file.
+    and only fetched once.  Returns a stable local ``.pt`` path suitable for
+    passing directly to ``ultralytics.YOLO`` (see :func:`_stabilize_pt_path`
+    for why the raw blob path cannot be used as-is).
     """
     try:
         from huggingface_hub import hf_hub_download
@@ -48,10 +97,17 @@ def resolve_plate_model_from_hub(
             "Install it with: pip install huggingface_hub"
         ) from exc
 
-    path = hf_hub_download(repo_id=repo_id, filename=filename)
+    raw = Path(hf_hub_download(repo_id=repo_id, filename=filename))
     logger.info("License-plate detector weights fetched from %s/%s (%s)",
-                repo_id, filename, path)
-    return Path(path)
+                repo_id, filename, raw)
+    stable = _stabilize_pt_path(raw, filename)
+    import hashlib as _hashlib
+    size = stable.stat().st_size
+    sha = _hashlib.sha256(stable.read_bytes()).hexdigest()[:16]
+    print(f"[MODEL] resolved={stable} suffix={stable.suffix} size={size} sha256:{sha}")
+    if stable.suffix != ".pt" or size == 0:
+        raise RuntimeError(f"FAILED to resolve a valid .pt model file: {stable}")
+    return stable
 
 
 class PlateDetector:
@@ -110,6 +166,7 @@ class PlateDetector:
         self._plate_aspect_min = max(float(min_plate_aspect_ratio), 0.0)
         self._plate_aspect_max = max(float(max_plate_aspect_ratio), self._plate_aspect_min)
         self._aspect_reject_count: int = 0
+        self._position_reject_count: int = 0
 
         # ------------------------------------------------------------------
         # Resolve device
@@ -153,6 +210,11 @@ class PlateDetector:
     def plate_aspect_ratio_rejects(self) -> int:
         """Number of plate candidates rejected by the aspect-ratio pre-filter."""
         return self._aspect_reject_count
+
+    @property
+    def plate_position_rejects(self) -> int:
+        """Number of plate candidates rejected by the vehicle-position filter."""
+        return self._position_reject_count
 
     def reset_plate_aspect_ratio_counter(self) -> None:
         """Zero the per-run aspect-ratio rejection counter."""
@@ -251,6 +313,25 @@ class PlateDetector:
             else:
                 for plate in detections:
                     plate["vehicle_idx"] = -1
+
+            # Position filter: real plates hang low on the vehicle (bumper
+            # zone, bottom ~45%); "text" boxes from a general text detector
+            # also catch livery/destination boards that sit mid-to-upper
+            # body.  Drop candidates whose center is above the lower +45%
+            # of their vehicle bbox.
+            kept: list[dict] = []
+            for plate in detections:
+                if (
+                    plate["vehicle_idx"] >= 0
+                    and 0 <= plate["vehicle_idx"] < len(vehicle_detections)
+                ):
+                    veh = vehicle_detections[plate["vehicle_idx"]]["bbox"]
+                    if not self._plate_sits_in_bumper_zone(plate["bbox"], veh):
+                        self._position_reject_count += 1
+                        logger.debug("Plate candidate rejected by bumper-zone filter.")
+                        continue
+                kept.append(plate)
+            detections = kept
 
             logger.info("Detected %d plate(s) via plate model.", len(detections))
         else:
@@ -386,6 +467,23 @@ class PlateDetector:
                     }
                 )
         return detections
+
+    @staticmethod
+    def _plate_sits_in_bumper_zone(
+        plate_box: list[int], vehicle_box: list[int], bumper_fraction: float = 0.55
+    ) -> bool:
+        """True when *plate_box* centre lies in the bumper zone of the vehicle.
+
+        The bumper zone is the vertical band from ``bumper_fraction`` of the
+        vehicle height down to the bottom of the vehicle bounding box.
+        Registration plates sit in the lower third near the bumper/wheels;
+        livery bands, route numbers and destination boards sit higher.
+        """
+        px1, py1, px2, py2 = plate_box
+        vx1, vy1, vx2, vy2 = vehicle_box
+        vh = (vy2 - vy1) or 1
+        plate_center_y = (py1 + py2) / 2
+        return plate_center_y >= vy1 + bumper_fraction * vh
 
     @staticmethod
     def _best_vehicle_match(

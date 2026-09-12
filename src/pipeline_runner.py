@@ -88,6 +88,7 @@ class PipelineRunner:
         min_vehicle_height_px: int = 60,
         plate_pad_ratio_x: float = 0.15,
         plate_pad_ratio_y: float = 0.30,
+        debug_crops_dir: Optional[str | Path] = None,
     ) -> None:
         self.camera_id = camera_id
         self.video_path = Path(video_path)
@@ -96,6 +97,10 @@ class PipelineRunner:
         self.min_vehicle_height_px = min_vehicle_height_px
         self.plate_pad_ratio_x = plate_pad_ratio_x
         self.plate_pad_ratio_y = plate_pad_ratio_y
+        self.debug_crops_dir: Optional[Path] = Path(debug_crops_dir) if debug_crops_dir else None
+        if self.debug_crops_dir is not None:
+            self.debug_crops_dir.mkdir(parents=True, exist_ok=True)
+        self._debug_saved: dict[str, int] = {}
         self._cameras_config_path = DEFAULT_CAMERAS_PATH
 
         # Merge calibration (GPS, pixel_to_meter_ratio, compass_bearing) onto
@@ -156,6 +161,10 @@ class PipelineRunner:
             "no_plate_box_found": 0,
             "plate_found_below_gate": 0,
             "plate_crop_heights": [],
+            "plate_crop_widths": [],
+            "plate_fullframe_fallback_used": 0,
+            "plate_fullframe_boxes": 0,
+            "plate_crop_tiny_skipped": 0,
             "plate_conf_cleared": 0,
             "plate_confidence_cleared_format_rejected": 0,
             "plate_format_rejected_samples": [],
@@ -301,11 +310,15 @@ class PipelineRunner:
             "no_plate_box_found": self._diag["no_plate_box_found"],
             "plate_found_below_gate": self._diag["plate_found_below_gate"],
             "plate_crop_heights_px": self._diag["plate_crop_heights"],
+            "plate_crop_widths_px": self._diag["plate_crop_widths"],
             "plate_confidence_gate_cleared": self._diag["plate_conf_cleared"],
             "plate_format_check_rejected": self._diag["plate_confidence_cleared_format_rejected"],
             "plate_format_rejected_samples": self._diag["plate_format_rejected_samples"],
             "plate_both_gates_cleared": self._diag["plate_gate_cleared"],
             "plate_aspect_ratio_rejected": self._diag["plate_aspect_ratio_rejected"],
+            "plate_fullframe_fallback_used": self._diag["plate_fullframe_fallback_used"],
+            "plate_fullframe_boxes": self._diag["plate_fullframe_boxes"],
+            "plate_crop_tiny_skipped": self._diag["plate_crop_tiny_skipped"],
             "preprocess_calls": self._diag["preprocess_calls"],
             "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
@@ -316,12 +329,17 @@ class PipelineRunner:
         """Print the per-run detection -> OCR diagnostic breakdown."""
         d = self._diag
         heights: list[int] = d["plate_crop_heights"]
+        widths: list[int] = d["plate_crop_widths"]
         attempted = d["vehicles_detected"] - d["vehicle_too_small"]
         plate_conf = self.detector.plate_conf_threshold
         aspect_min, aspect_max = self.detector.plate_aspect_ratio_bounds
         agg = (
             f"{min(heights)} / {sum(heights)/len(heights):.1f} / {max(heights)}"
             if heights else "n/a"
+        )
+        wagg = (
+            f"{min(widths)} / {sum(widths)/len(widths):.1f} / {max(widths)}"
+            if widths else "n/a"
         )
         format_samples = d["plate_format_rejected_samples"]
         sample_txt = ", ".join(f"'{s}'" for s in format_samples[:10]) or "none"
@@ -338,8 +356,12 @@ class PipelineRunner:
             f"  - no plate box found       : {d['no_plate_box_found']}  (plate conf < {plate_conf})",
             f"  - aspect-ratio rejected    : {d['plate_aspect_ratio_rejected']}  (outside {aspect_min:g}:1 - {aspect_max:g}:1)",
             f"  - plate box localized      : {d['vehicles_with_plate_box']}",
+            f"  - full-frame fallback hits : {d['plate_fullframe_fallback_used']}  (full-frame boxes total: {d['plate_fullframe_boxes']})",
+            f"  - tiny crops rejected      : {d['plate_crop_tiny_skipped']}  (w<20 or h<10, never sent to OCR)",
             f"Plate crop height (px)       : {heights}",
             f"  - min / avg / max          : {agg}",
+            f"Plate crop width (px)        : {widths}",
+            f"  - min / avg / max          : {wagg}",
             f"Plate found but below gate   : {d['plate_found_below_gate']}  (ocr conf < {self.min_ocr_confidence})",
             f"Confidence gate cleared      : {d['plate_conf_cleared']}",
             f"  - format check rejected    : {d['plate_confidence_cleared_format_rejected']}  (not an Indian plate)"
@@ -513,6 +535,29 @@ class PipelineRunner:
 
             # Run the plate model on the vehicle crop (not the full frame).
             plate_dets = self.detector.detect_plates_in_crop(frame, veh["bbox"])
+            from_fallback = False
+            if not plate_dets:
+                # Fallback B: full-frame plate pass, associated back to this
+                # vehicle via the detector's IoU matching.  Cached per frame
+                # so N vehicles cost one extra inference, not N.
+                if frame_number != getattr(self, "_ff_cache_frame", -1):
+                    try:
+                        self._ff_cache = self.detector.detect_plates(
+                            frame, vehicle_detections=vehicles
+                        )
+                    except Exception:
+                        logger.exception("[PLATE] full-frame fallback inference failed")
+                        self._ff_cache = []
+                    self._ff_cache_frame = frame_number
+                    self._diag["plate_fullframe_boxes"] += len(self._ff_cache)
+                plate_dets = [p for p in self._ff_cache if p.get("vehicle_idx") == idx]
+                from_fallback = bool(plate_dets)
+                if from_fallback:
+                    self._diag["plate_fullframe_fallback_used"] += 1
+                    logger.info(
+                        "[PLATE] %s frame=%d veh=%d in-crop empty, full-frame fallback gave %d box(es)",
+                        self.camera_id, frame_number, idx, len(plate_dets),
+                    )
             if not plate_dets:
                 logger.info(
                     "[PLATE] %s frame=%d veh=%d no plate box found (plate conf < %s)",
@@ -538,6 +583,11 @@ class PipelineRunner:
 
             raw_crop_w = bx2 - bx1
             raw_crop_h = by2 - by1
+            logger.debug(
+                "[PLATE-BBOX] %s frame=%d veh=%d plate box %d x %d px (conf=%.2f)",
+                self.camera_id, frame_number, idx,
+                raw_crop_w, raw_crop_h, best["confidence"],
+            )
 
             # Padding margin around the detected plate box (~15-20% of width,
             # ~30% of height) so leading state/series characters are not
@@ -552,14 +602,18 @@ class PipelineRunner:
             crop_w = pbx2 - pbx1
             crop_h = pby2 - pby1
             self._diag["plate_crop_heights"].append(crop_h)
+            self._diag["plate_crop_widths"].append(crop_w)
 
             crop = frame[pby1:pby2, pbx1:pbx2]
             if crop_w < 20 or crop_h < 10:
-                logger.debug(
-                    "[OCR] %s frame=%d veh=%d plate crop too small (w=%d h=%d); skipping",
+                logger.info(
+                    "[OCR] %s frame=%d veh=%d plate crop tiny, rejected before OCR (w=%d h=%d)",
                     self.camera_id, frame_number, idx, crop_w, crop_h,
                 )
+                self._diag["plate_crop_tiny_skipped"] += 1
+                self._maybe_save_debug(f"tiny_{crop_w}x{crop_h}", crop, frame_number, idx)
                 continue
+            self._maybe_save_debug("crop", crop, frame_number, idx)
 
             track_id = veh_track_ids.get(idx)
             track_key = self._track_key(track_id, frame_number, idx)
@@ -644,6 +698,27 @@ class PipelineRunner:
             )
 
         return {"plate_entries": plate_entries, "sightings": sightings, "read_count": read_count}
+
+    def _maybe_save_debug(self, category: str, crop, frame_number: int, veh_idx: int,
+                            max_per_category: int = 5) -> None:
+        """Save a bounded number of plate crops per category for inspection.
+
+        No-op unless ``debug_crops_dir`` was configured.  Saves at most
+        ``max_per_category`` images per category so a long run cannot fill
+        the disk/Drive.
+        """
+        if self.debug_crops_dir is None:
+            return
+        try:
+            n = self._debug_saved.get(category, 0)
+            if n >= max_per_category:
+                return
+            safe = "".join(c if c.isalnum() or c in "_x" else "_" for c in category)[:40]
+            out = self.debug_crops_dir / f"{self.camera_id}_f{frame_number}_v{veh_idx}_{safe}_{n}.jpg"
+            cv2.imwrite(str(out), crop)
+            self._debug_saved[category] = n + 1
+        except Exception:
+            logger.exception("[DEBUG] failed to save debug crop")
 
     def _handle_sighting(self, sighting: dict[str, Any]) -> None:
         """Persist a sighting to the shared DB and run the alert check."""
