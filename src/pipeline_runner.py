@@ -159,6 +159,10 @@ class PipelineRunner:
         self._variant_trials: list[dict[str, Any]] = []
         # Best-variant images retained for the top-5 Drive save.
         self._top_images: list[dict[str, Any]] = []
+        # fast-plate-ocr A/B trials (diagnostic only; lazy backend).
+        self._fast_trials: list[dict[str, Any]] = []
+        self._fast_top_images: list[dict[str, Any]] = []
+        self.fast_ocr = None
 
         # Per-run diagnostics for the detection -> OCR path.
         self._diag: dict[str, Any] = {
@@ -333,6 +337,7 @@ class PipelineRunner:
 
         ledger_csv = self._save_ledger_csv()
         top5_csv = self._save_top5()
+        fast_top5_csv = self._save_fast_top5()
 
         summary["plate_diagnostics"] = {
             "vehicles_detected": self._diag["vehicles_detected"],
@@ -364,6 +369,8 @@ class PipelineRunner:
             "candidate_ledger_rows": len(self._ledger),
             "variant_trials": len(self._variant_trials),
             "top5_direct_csv": top5_csv,
+            "fast_trials": len(self._fast_trials),
+            "fast_top5_csv": fast_top5_csv,
             "preprocess_calls": self._diag["preprocess_calls"],
             "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
@@ -649,6 +656,7 @@ class PipelineRunner:
                 "accept_text": "", "accept_conf": 0.0,
                 "corrected": "", "regex_pass": False,
                 "best_variant": "", "best_variant_text": "", "best_variant_conf": 0.0,
+                "fast_text": "", "fast_conf": None,
                 "ocr_threshold": self.min_ocr_confidence,
                 "variant_error": "",
                 "direct_error": "",
@@ -762,6 +770,34 @@ class PipelineRunner:
                 self.camera_id, frame_number, idx,
                 [(t["variant"], t["text"], round(t["conf"], 3), t["status"])
                  for t in direct_trials],
+            )
+
+            # fast-plate-ocr A/B (diagnostic ONLY): RAW crop, no aggressive
+            # preprocessing.  Acceptance below still uses read_plate().
+            fast = self._run_fastplate(crop, frame_number, idx)
+            row["fast_text"] = fast["text"]
+            row["fast_conf"] = fast["conf"]
+            self._fast_trials.append({
+                "frame": frame_number, "track_id": track_id,
+                "det_source": det_source,
+                "plate_bbox": str([int(v) for v in best["bbox"]]),
+                "det_conf": det_conf, "crop_w": crop_w, "crop_h": crop_h,
+                "text": fast["text"], "conf": fast["conf"],
+                "normalized": fast["normalized"],
+                "regex_pass": fast["regex_pass"], "status": fast["status"],
+            })
+            if fast["status"] == "ok" and fast["text"]:
+                self._fast_top_images.append({
+                    "conf": fast["conf"] if fast["conf"] is not None else -1.0,
+                    "image": crop,
+                    "frame": frame_number, "track_id": track_id,
+                    "text": fast["text"], "det_conf": det_conf,
+                    "normalized": fast["normalized"],
+                })
+            logger.info(
+                "[FASTPLATE] %s frame=%d veh=%d text='%s' conf=%s regex=%s status=%s",
+                self.camera_id, frame_number, idx, fast["text"],
+                fast["conf"], fast["regex_pass"], fast["status"],
             )
 
             track_key = self._track_key(track_id, frame_number, idx)
@@ -999,6 +1035,7 @@ class PipelineRunner:
                 "ocr_raw_text", "ocr_raw_conf", "ocr_pre_text", "ocr_pre_conf",
                 "accept_text", "accept_conf", "corrected", "regex_pass",
                 "best_variant", "best_variant_text", "best_variant_conf",
+                "fast_text", "fast_conf",
                 "ocr_threshold", "variant_error", "direct_error", "final_reason"]
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1012,6 +1049,34 @@ class PipelineRunner:
             traceback.print_exc()
             logger.exception("[LEDGER] CSV save failed")
             return None
+
+    def _run_fastplate(self, crop, frame_number: int, veh_idx: int) -> dict[str, Any]:
+        """Run fast-plate-ocr on the RAW crop (diagnostic ONLY).
+
+        Lazily builds the backend (model downloads once on first use).
+        Never raises: failures are logged with tracebacks and recorded.
+        """
+        import traceback
+
+        out = {"text": "", "conf": None, "normalized": "",
+               "regex_pass": False, "status": ""}
+        try:
+            if self.fast_ocr is None:
+                from src.ocr.fastplate import FastPlateOCR
+                self.fast_ocr = FastPlateOCR()
+            res = self.fast_ocr.read_crop(crop)
+            out["text"] = res["text"]
+            out["conf"] = res["conf"]
+            out["status"] = res["status"]
+            norm = self.ocr._normalize_confusions(res["text"]) if res["text"] else ""
+            out["normalized"] = norm
+            out["regex_pass"] = looks_like_plate(norm)
+        except Exception:
+            traceback.print_exc()
+            logger.exception("[FASTPLATE] %s frame=%d veh=%d failed",
+                             self.camera_id, frame_number, veh_idx)
+            out["status"] = "failed"
+        return out
 
     def _save_top5(self) -> Optional[str]:
         """Save the top-5 direct-recognition trials by OCR confidence.
@@ -1051,6 +1116,47 @@ class PipelineRunner:
             import traceback
             traceback.print_exc()
             logger.exception("[DIRECT] top-5 save failed")
+            return None
+
+    def _save_fast_top5(self) -> Optional[str]:
+        """Save the top-5 fast-plate-ocr trials by confidence to Drive.
+
+        Writes 5 raw-crop images + ``fast_top5.csv`` (frame, det conf,
+        crop size, text, conf, normalized, regex).  Bounded: max 5 images.
+        """
+        import csv
+
+        if not self._fast_top_images:
+            return None
+        out_dir = (self.debug_crops_dir or (Path("data") / "debug_ocr")) / "fast_top5"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ranked = sorted(self._fast_top_images, key=lambda e: e["conf"], reverse=True)[:5]
+        try:
+            for i, e in enumerate(ranked):
+                c = e["conf"]
+                cstr = f"{c:.4f}" if c is not None else "noconf"
+                cv2.imwrite(
+                    str(out_dir / f"top{i + 1}_conf{cstr}"
+                                   f"_f{e['frame']}_t{e['track_id']}.jpg"),
+                    e["image"],
+                )
+            csv_path = out_dir / "fast_top5.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=["frame", "track_id", "text", "conf",
+                                "normalized", "det_conf"],
+                    extrasaction="ignore",
+                )
+                w.writeheader()
+                for e in ranked:
+                    w.writerow(e)
+            logger.info("[FASTPLATE] saved top-5 to %s", out_dir)
+            return str(csv_path)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            logger.exception("[FASTPLATE] top-5 save failed")
             return None
 
     def _print_ledger_summary(self) -> None:
