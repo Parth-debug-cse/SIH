@@ -185,6 +185,7 @@ class PlateDetector:
         # Load plate model (optional)
         # ------------------------------------------------------------------
         self._plate_model = None
+        self._plate_model_path: Optional[Path] = None
         if plate_model_path is not None:
             resolved_plate = self._resolve_model_path(plate_model_path, None)
             # No blob path may ever reach Ultralytics: a raw
@@ -193,6 +194,7 @@ class PlateDetector:
             # Whatever string was passed in, it is stabilized to a real
             # `.pt` file (or we fail loudly here, not mid-predict).
             resolved_plate = self._require_pt_weights(resolved_plate)
+            self._plate_model_path = resolved_plate
             self._plate_model = self._load_yolo(resolved_plate)
             logger.info("Plate model loaded from %s", resolved_plate)
         else:
@@ -216,6 +218,11 @@ class PlateDetector:
     def plate_aspect_ratio_rejects(self) -> int:
         """Number of plate candidates rejected by the aspect-ratio pre-filter."""
         return self._aspect_reject_count
+
+    @property
+    def plate_model_path(self) -> Optional[Path]:
+        """Stabilized ``.pt`` path the plate YOLO was built from (None if disabled)."""
+        return self._plate_model_path
 
     @property
     def plate_position_rejects(self) -> int:
