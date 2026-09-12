@@ -187,6 +187,12 @@ class PlateDetector:
         self._plate_model = None
         if plate_model_path is not None:
             resolved_plate = self._resolve_model_path(plate_model_path, None)
+            # No blob path may ever reach Ultralytics: a raw
+            # `hf_hub_download` result (`.../blobs/<hash>`, no extension)
+            # raises `TypeError: not a supported model format` inside YOLO.
+            # Whatever string was passed in, it is stabilized to a real
+            # `.pt` file (or we fail loudly here, not mid-predict).
+            resolved_plate = self._require_pt_weights(resolved_plate)
             self._plate_model = self._load_yolo(resolved_plate)
             logger.info("Plate model loaded from %s", resolved_plate)
         else:
@@ -590,6 +596,37 @@ class PlateDetector:
         return Path(filename)
 
     @staticmethod
+    def _require_pt_weights(path: Path) -> Path:
+        """Stabilize a plate-model path to a real ``.pt`` file or fail loudly.
+
+        Accepts an already-valid ``.pt`` file, an HF cache blob path
+        (``.../blobs/<hash>``, routed through :func:`_stabilize_pt_path`),
+        or a snapshot path — and returns a verified ``.pt`` path.  Prints
+        the resolved path/suffix/size and raises ``RuntimeError`` (never a
+        downstream Ultralytics ``TypeError``) when no valid file results.
+        Detection filters are untouched by this; it only guards construction.
+        """
+        p = Path(path)
+        if p.suffix == ".pt" and p.is_file() and p.stat().st_size > 0:
+            print(f"[PLATE-MODEL] path={p} suffix=.pt size={p.stat().st_size}")
+            if "blobs" in p.parts:
+                raise RuntimeError(f"FAILED: .pt path inside HF blobs cache: {p}")
+            return p
+        if p.is_file():
+            # Existing file with wrong/missing suffix: almost certainly an
+            # HF blob.  Stabilize to snapshot sibling or deterministic copy.
+            stable = _stabilize_pt_path(p, HF_PLATE_MODEL_FILENAME)
+            size = stable.stat().st_size
+            print(f"[PLATE-MODEL] stabilized {p} -> {stable} size={size}")
+            if stable.suffix != ".pt" or size == 0 or "blobs" in stable.parts:
+                raise RuntimeError(f"FAILED to stabilize plate weights: {p} -> {stable}")
+            return stable
+        raise RuntimeError(
+            f"FAILED: plate model file not found: {p} "
+            "(pull latest repo in Colab and re-run model resolution)"
+        )
+
+    @staticmethod
     def _load_yolo(path: Path):
         """Load and return a YOLO model from *path*."""
         try:
@@ -599,6 +636,13 @@ class PlateDetector:
                 "ultralytics is required.  Install it with: pip install ultralytics"
             ) from exc
 
+        # Defense in depth: an extensionless HF blob path must never reach
+        # Ultralytics (it raises an opaque TypeError there).  Fail here with
+        # the actionable message instead.
+        if Path(path).suffix != ".pt":
+            raise RuntimeError(
+                f"FAILED: refusing to pass non-.pt model path to YOLO: {path}"
+            )
         logger.info("Loading YOLO model from %s …", path)
         model = YOLO(str(path))
         return model
