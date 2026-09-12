@@ -951,7 +951,7 @@ class PipelineRunner:
             logger.info(
                 "[OCR] %s track=%s plate=%s conf=%.2f (votes=%d)",
                 self.camera_id, track_id, text, conf,
-                ocr_result.get("voted_count", 0),
+                hybrid_res.get("voted_count", 0),
             )
             sightings.append(
                 {

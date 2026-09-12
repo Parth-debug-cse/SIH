@@ -76,3 +76,20 @@ def test_gd75000_rejected_state_code():
 
 def test_ka03ns5132_accepted():
     assert is_valid_india_plate("KA03NS5132") == (True, "ok")
+
+
+def test_every_return_path_carries_voted_count():
+    # Guards the pipeline_runner accepted-branch log line, which reads
+    # hybrid_res.get("voted_count", 0): every dict below must carry the key.
+    fast = _FastSpy()
+    hybrid = HybridPlateOCR(easy_ocr=_EasyStub(), fast_backend=fast)
+    r1 = hybrid.read_plate(_crop(80), crop_height_px=80)
+    assert r1["voted_count"] == 0
+    hybrid2 = HybridPlateOCR(
+        easy_ocr=_EasyStub(text="KA01AB1234", conf=0.9),
+        fast_backend=_FastSpy(),
+    )
+    r2 = hybrid2.read_plate(_crop(40), crop_height_px=40)
+    assert r2["voted_count"] == 1  # real EasyOCR vote depth passes through
+    r3 = hybrid.read_plate(_crop(40), crop_height_px=40)
+    assert r3["voted_count"] == 0

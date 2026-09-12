@@ -914,7 +914,8 @@ class HybridPlateOCR:
         Returns dict with keys: text, confidence (None when the backend
         provides none — never fabricated), engine_used
         ('fastplate'/'easyocr'), regex_pass (via :func:`is_valid_india_plate`),
-        validity_reason, reason.
+        validity_reason, reason, voted_count (EasyOCR vote depth; 0 on the
+        fastplate path, which does not vote).
 
         Engine failures are LOUD (traceback printed) but non-fatal: they
         return ``reason='engine_failed'`` with empty text so one bad crop
@@ -931,11 +932,11 @@ class HybridPlateOCR:
                 logger.exception("HybridPlateOCR fastplate path failed")
                 return {"text": "", "confidence": None, "engine_used": "fastplate",
                         "regex_pass": False, "validity_reason": "engine_failed",
-                        "reason": "engine_failed"}
+                        "voted_count": 0, "reason": "engine_failed"}
             valid, vreason = is_valid_india_plate(res["text"]) if res["text"] else (False, 'empty')
             return {"text": res["text"], "confidence": res["conf"],
                     "engine_used": "fastplate", "regex_pass": valid,
-                    "validity_reason": vreason,
+                    "validity_reason": vreason, "voted_count": 0,
                     "reason": "ok" if res["text"] else "fastplate_empty"}
         try:
             res = self.easy.read_plate(crop_bgr, track_key=track_key)
@@ -944,12 +945,13 @@ class HybridPlateOCR:
             logger.exception("HybridPlateOCR easyocr path failed")
             return {"text": "", "confidence": 0.0, "engine_used": "easyocr",
                     "regex_pass": False, "validity_reason": "engine_failed",
-                    "reason": "engine_failed"}
+                    "voted_count": 0, "reason": "engine_failed"}
         if not res["text"]:
             return {"text": "", "confidence": 0.0, "engine_used": "easyocr",
                     "regex_pass": False, "validity_reason": "empty",
-                    "reason": "below_resolution_floor"}
+                    "voted_count": 0, "reason": "below_resolution_floor"}
         valid, vreason = is_valid_india_plate(res["text"])
         return {"text": res["text"], "confidence": res["confidence"],
                 "engine_used": "easyocr", "regex_pass": valid,
-                "validity_reason": vreason, "reason": "easyocr_fallback"}
+                "validity_reason": vreason, "voted_count": res.get("voted_count", 0),
+                "reason": "easyocr_fallback"}
