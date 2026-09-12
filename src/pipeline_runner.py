@@ -32,7 +32,7 @@ from src.detection.detector import (
     PlateDetector,
     resolve_plate_model_from_hub,
 )
-from src.ocr.reader import PlateOCR, looks_like_plate
+from src.ocr.reader import PlateOCR, looks_like_plate, position_correct
 from src.tracking.tracker import VehicleTracker
 from src.alerts.engine import AlertEngine
 from src.db.schema import insert_row
@@ -152,6 +152,9 @@ class PipelineRunner:
         self._sightings: list[dict[str, Any]] = []
         self._alerts: list[dict[str, Any]] = []
         self._analytics_entries: list[dict[str, Any]] = []
+        # Candidate ledger: one row per evaluated plate box (diagnostic
+        # only; never influences acceptance).  See _record_candidate().
+        self._ledger: list[dict[str, Any]] = []
 
         # Per-run diagnostics for the detection -> OCR path.
         self._diag: dict[str, Any] = {
@@ -165,6 +168,19 @@ class PipelineRunner:
             "plate_fullframe_fallback_used": 0,
             "plate_fullframe_boxes": 0,
             "plate_crop_tiny_skipped": 0,
+            # Explicit candidate-ledger counters (diagnostic mirrors; the
+            # acceptance thresholds they describe are unchanged):
+            "candidate_boxes": 0,      # every boxed candidate evaluated
+            "aspect_rejected": 0,      # run-delta of detector aspect filter
+            "position_rejected": 0,    # run-delta of detector bumper filter
+            "tiny_rejected": 0,        # == plate_crop_tiny_skipped
+            "detector_conf_rejected": 0,  # == no_plate_box_found: no box
+                                       # cleared the plate-conf threshold
+            "ocr_attempted": 0,        # every acceptance-path read_plate call
+            "ocr_empty": 0,            # OCR returned no text at all
+            "ocr_low_conf": 0,         # == plate_found_below_gate
+            "regex_rejected": 0,       # == plate_confidence_cleared_format_rejected
+            "accepted": 0,             # == plate_gate_cleared
             "plate_conf_cleared": 0,
             "plate_confidence_cleared_format_rejected": 0,
             "plate_format_rejected_samples": [],
@@ -303,6 +319,16 @@ class PipelineRunner:
             summary["alerts_triggered"],
         )
 
+        # Detector-internal filter deltas for this run (the detector object
+        # is per-runner, so end-of-run totals are the run deltas).  These
+        # boxes never reach the ledger — they are filtered inside the
+        # detector — hence reported as aggregate counters, not rows.
+        self._diag["aspect_rejected"] = self.detector.plate_aspect_ratio_rejects
+        self._diag["position_rejected"] = self.detector.plate_position_rejects
+        self._diag["detector_conf_rejected"] = self._diag["no_plate_box_found"]
+
+        ledger_csv = self._save_ledger_csv()
+
         summary["plate_diagnostics"] = {
             "vehicles_detected": self._diag["vehicles_detected"],
             "vehicle_too_small": self._diag["vehicle_too_small"],
@@ -319,10 +345,23 @@ class PipelineRunner:
             "plate_fullframe_fallback_used": self._diag["plate_fullframe_fallback_used"],
             "plate_fullframe_boxes": self._diag["plate_fullframe_boxes"],
             "plate_crop_tiny_skipped": self._diag["plate_crop_tiny_skipped"],
+            "candidate_boxes": self._diag["candidate_boxes"],
+            "aspect_rejected": self._diag["aspect_rejected"],
+            "position_rejected": self._diag["position_rejected"],
+            "tiny_rejected": self._diag["tiny_rejected"],
+            "detector_conf_rejected": self._diag["detector_conf_rejected"],
+            "ocr_attempted": self._diag["ocr_attempted"],
+            "ocr_empty": self._diag["ocr_empty"],
+            "ocr_low_conf": self._diag["ocr_low_conf"],
+            "regex_rejected": self._diag["regex_rejected"],
+            "accepted": self._diag["accepted"],
+            "candidate_ledger_csv": ledger_csv,
+            "candidate_ledger_rows": len(self._ledger),
             "preprocess_calls": self._diag["preprocess_calls"],
             "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
         self._print_diagnostic_summary(summary)
+        self._print_ledger_summary()
         return summary
 
     def _print_diagnostic_summary(self, summary: dict[str, Any]) -> None:
@@ -569,16 +608,55 @@ class PipelineRunner:
 
             best = max(plate_dets, key=lambda p: p["confidence"])
             self._diag["vehicles_with_plate_box"] += 1
+            self._diag["candidate_boxes"] += 1
+            det_conf = float(best["confidence"])
+            det_source = "fullframe_fallback" if from_fallback else "in_crop"
+
+            track_id = veh_track_ids.get(idx)
+
+            # Bumper/position verdict for the ledger (report-only: fallback
+            # boxes already passed the detector's internal filter, in-crop
+            # boxes are only evaluated here — nothing is filtered out).
+            try:
+                bumper_passed: Optional[bool] = bool(
+                    self.detector._plate_sits_in_bumper_zone(best["bbox"], veh["bbox"])
+                )
+            except Exception:
+                logger.exception(
+                    "[LEDGER] %s frame=%d veh=%d bumper check failed",
+                    self.camera_id, frame_number, idx,
+                )
+                bumper_passed = None
+
+            row: dict[str, Any] = {
+                "frame": frame_number,
+                "track_id": track_id,
+                "det_source": det_source,
+                "plate_bbox": [int(v) for v in best["bbox"]],
+                "det_conf": det_conf,
+                "det_threshold": self.detector.plate_conf_threshold,
+                "crop_w": None, "crop_h": None, "aspect": None,
+                "bumper_passed": bumper_passed,
+                "ocr_raw_text": "", "ocr_raw_conf": 0.0,
+                "ocr_pre_text": "", "ocr_pre_conf": 0.0,
+                "accept_text": "", "accept_conf": 0.0,
+                "corrected": "", "regex_pass": False,
+                "ocr_threshold": self.min_ocr_confidence,
+                "variant_error": "",
+                "final_reason": "",
+            }
 
             bx1 = max(0, min(int(best["bbox"][0]), w_max))
             by1 = max(0, min(int(best["bbox"][1]), h_max))
             bx2 = max(0, min(int(best["bbox"][2]), w_max))
             by2 = max(0, min(int(best["bbox"][3]), h_max))
             if bx2 <= bx1 or by2 <= by1:
-                logger.debug(
+                logger.info(
                     "[OCR] %s frame=%d veh=%d degenerate plate box; skipping",
                     self.camera_id, frame_number, idx,
                 )
+                row["final_reason"] = "degenerate_box"
+                self._record_candidate(row)
                 continue
 
             raw_crop_w = bx2 - bx1
@@ -603,6 +681,9 @@ class PipelineRunner:
             crop_h = pby2 - pby1
             self._diag["plate_crop_heights"].append(crop_h)
             self._diag["plate_crop_widths"].append(crop_w)
+            row["crop_w"] = crop_w
+            row["crop_h"] = crop_h
+            row["aspect"] = round(crop_w / crop_h, 2) if crop_h > 0 else None
 
             crop = frame[pby1:pby2, pbx1:pbx2]
             if crop_w < 20 or crop_h < 10:
@@ -611,16 +692,38 @@ class PipelineRunner:
                     self.camera_id, frame_number, idx, crop_w, crop_h,
                 )
                 self._diag["plate_crop_tiny_skipped"] += 1
-                self._maybe_save_debug(f"tiny_{crop_w}x{crop_h}", crop, frame_number, idx)
+                self._diag["tiny_rejected"] += 1
+                row["final_reason"] = "tiny_rejected"
+                self._save_candidate_set("tiny_rejected", frame, crop, None,
+                                         [pbx1, pby1, pbx2, pby2], veh["bbox"],
+                                         frame_number, idx)
+                self._record_candidate(row)
                 continue
-            self._maybe_save_debug("crop", crop, frame_number, idx)
 
-            track_id = veh_track_ids.get(idx)
+            # Diagnostic-only variant reads (direct EasyOCR calls, no vote
+            # history touched): raw 3x-upscaled vs full CLAHE+upscale+unsharp
+            # preprocessing.  Acceptance below uses read_plate() unchanged.
+            variants = self._diagnose_variants(crop, frame_number, idx)
+            row["ocr_raw_text"] = variants["raw_text"]
+            row["ocr_raw_conf"] = variants["raw_conf"]
+            row["ocr_pre_text"] = variants["pre_text"]
+            row["ocr_pre_conf"] = variants["pre_conf"]
+            row["variant_error"] = variants["error"]
+
             track_key = self._track_key(track_id, frame_number, idx)
 
+            self._diag["ocr_attempted"] += 1
             ocr_result = self.ocr.read_plate(crop, track_key=track_key)
             text = ocr_result["text"]
             conf = ocr_result["confidence"]
+            row["accept_text"] = text
+            row["accept_conf"] = conf
+            try:
+                row["corrected"] = position_correct(text) if text else ""
+            except Exception:
+                logger.exception("[LEDGER] position_correct failed")
+                row["corrected"] = text
+            row["regex_pass"] = bool(text) and looks_like_plate(text)
 
             entry = {
                 "bbox": [pbx1, pby1, pbx2, pby2],
@@ -634,12 +737,22 @@ class PipelineRunner:
             plate_entries.append(entry)
 
             if not text:
+                # OCR returned nothing: counted explicitly (was previously
+                # an uncounted silent branch).  Thresholds unchanged.
                 logger.info(
                     "[OCR] %s frame=%d veh=%d plate found but OCR read nothing",
                     self.camera_id, frame_number, idx,
                 )
+                self._diag["ocr_empty"] += 1
+                row["final_reason"] = "ocr_empty"
+                self._save_candidate_set("ocr_empty", frame, crop, variants,
+                                         [pbx1, pby1, pbx2, pby2], veh["bbox"],
+                                         frame_number, idx)
+                self._record_candidate(row)
                 continue
 
+            # Gate 1 (UNCHANGED): OCR confidence >= min_ocr_confidence.
+            # below_gate fires only here — non-empty text under threshold.
             if conf < self.min_ocr_confidence:
                 logger.info(
                     "[OCR] %s frame=%d veh=%d plate found but below confidence "
@@ -648,16 +761,20 @@ class PipelineRunner:
                     text, conf, self.min_ocr_confidence,
                 )
                 self._diag["plate_found_below_gate"] += 1
+                self._diag["ocr_low_conf"] += 1
+                row["final_reason"] = "ocr_low_conf"
+                self._save_candidate_set("low_conf", frame, crop, variants,
+                                         [pbx1, pby1, pbx2, pby2], veh["bbox"],
+                                         frame_number, idx)
+                self._record_candidate(row)
                 continue
 
             # First gate cleared: confidence.  Record it before the second
             # (format) gate so "before vs after" is quantifiable.
             self._diag["plate_conf_cleared"] += 1
 
-            # Second gate, alongside (not instead of) the confidence gate:
-            # the read must also look like an Indian plate string, otherwise
-            # branding/route-number boards such as "BMTC" would be written as
-            # sightings.  Both gates must pass for the sighting to be stored.
+            # Gate 2 (UNCHANGED), alongside Gate 1: Indian plate format.
+            # format_rejected fires only here — confident but non-plate text.
             if not looks_like_plate(text):
                 logger.info(
                     "[OCR] %s frame=%d veh=%d plate found but format check "
@@ -666,14 +783,26 @@ class PipelineRunner:
                     text, conf, self.min_ocr_confidence,
                 )
                 self._diag["plate_confidence_cleared_format_rejected"] += 1
+                self._diag["regex_rejected"] += 1
                 samples = self._diag["plate_format_rejected_samples"]
                 if len(samples) < 30:
                     samples.append(text)
+                row["final_reason"] = "regex_rejected"
+                self._save_candidate_set("regex_rejected", frame, crop, variants,
+                                         [pbx1, pby1, pbx2, pby2], veh["bbox"],
+                                         frame_number, idx)
+                self._record_candidate(row)
                 continue
 
-            # Confident + plate-shaped reading -> both gates cleared.
+            # Both gates cleared (UNCHANGED conditions).
             read_count += 1
             self._diag["plate_gate_cleared"] += 1
+            self._diag["accepted"] += 1
+            row["final_reason"] = "accepted"
+            self._save_candidate_set("accepted", frame, crop, variants,
+                                     [pbx1, pby1, pbx2, pby2], veh["bbox"],
+                                     frame_number, idx)
+            self._record_candidate(row)
             ts = datetime.now().timestamp()
             logger.info(
                 "[OCR] %s track=%s plate=%s conf=%.2f (votes=%d)",
@@ -719,6 +848,157 @@ class PipelineRunner:
             self._debug_saved[category] = n + 1
         except Exception:
             logger.exception("[DEBUG] failed to save debug crop")
+
+    def _diagnose_variants(self, crop, frame_number: int, veh_idx: int) -> dict[str, Any]:
+        """Run diagnostic-only OCR variants on *crop* (no vote history touched).
+
+        Compares raw 3x-upscaled vs full CLAHE+upscale+unsharp preprocessing
+        using direct EasyOCR calls + ``_extract_text``.  Failures are logged
+        with ``traceback`` and recorded — never raised, never silent — so one
+        bad crop cannot kill a run, but nothing is hidden either.
+        """
+        import traceback
+
+        out = {"raw_text": "", "raw_conf": 0.0, "pre_text": "", "pre_conf": 0.0,
+               "raw_up": None, "pre": None, "error": ""}
+        try:
+            h, w = crop.shape[:2]
+            scale = 3.0 if max(h, w) < 400 else 160.0 / max(h, w)
+            raw_up = cv2.resize(crop, None, fx=scale, fy=scale,
+                                interpolation=cv2.INTER_CUBIC)
+            out["raw_up"] = raw_up
+            raw_res = self.ocr.reader.readtext(raw_up, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            t, c = self.ocr._extract_text(raw_res)
+            out["raw_text"], out["raw_conf"] = t, float(c)
+        except Exception:
+            traceback.print_exc()
+            out["error"] += "raw_variant_failed; "
+            logger.exception("[DIAG] %s frame=%d veh=%d raw-variant OCR failed",
+                             self.camera_id, frame_number, veh_idx)
+        try:
+            pre = self.ocr.preprocess_plate(crop)
+            out["pre"] = pre
+            pre_res = self.ocr.reader.readtext(pre, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            t, c = self.ocr._extract_text(pre_res)
+            out["pre_text"], out["pre_conf"] = t, float(c)
+        except Exception:
+            traceback.print_exc()
+            out["error"] += "pre_variant_failed; "
+            logger.exception("[DIAG] %s frame=%d veh=%d pre-variant OCR failed",
+                             self.camera_id, frame_number, veh_idx)
+        return out
+
+    def _record_candidate(self, row: dict[str, Any]) -> None:
+        """Append one candidate row to the ledger with a compact log line."""
+        self._ledger.append(row)
+        logger.info(
+            "[CANDIDATE] %s frame=%d track=%s src=%s bbox=%s det_conf=%.3f(>=%.2f) "
+            "crop=%sx%s aspect=%s bumper=%s | raw='%s'@%.3f pre='%s'@%.3f "
+            "accept='%s'@%.3f corrected='%s' regex=%s thr=%.2f -> %s",
+            self.camera_id, row["frame"], row["track_id"], row["det_source"],
+            row["plate_bbox"], row["det_conf"], row["det_threshold"],
+            row["crop_w"], row["crop_h"], row["aspect"], row["bumper_passed"],
+            row["ocr_raw_text"], row["ocr_raw_conf"],
+            row["ocr_pre_text"], row["ocr_pre_conf"],
+            row["accept_text"], row["accept_conf"],
+            row["corrected"], row["regex_pass"], row["ocr_threshold"],
+            row["final_reason"],
+        )
+
+    def _save_candidate_set(self, reason: str, frame, crop, variants,
+                            pbbox: list[int], vbbox: list[int],
+                            frame_number: int, veh_idx: int) -> None:
+        """Save raw/up/pre/annotated images for one candidate (bounded)."""
+        if self.debug_crops_dir is None:
+            return
+        try:
+            self._maybe_save_debug(f"{reason}_raw", crop, frame_number, veh_idx)
+            if variants is not None:
+                if variants.get("raw_up") is not None:
+                    self._maybe_save_debug(f"{reason}_up", variants["raw_up"],
+                                           frame_number, veh_idx)
+                if variants.get("pre") is not None:
+                    self._maybe_save_debug(f"{reason}_pre", variants["pre"],
+                                           frame_number, veh_idx)
+            ann = frame.copy()
+            x1, y1, x2, y2 = [int(v) for v in vbbox]
+            ann = cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            px1, py1, px2, py2 = [int(v) for v in pbbox]
+            ann = cv2.rectangle(ann, (px1, py1), (px2, py2), (0, 0, 255), 2)
+            self._maybe_save_debug(f"{reason}_ann", ann, frame_number, veh_idx)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            logger.exception("[DEBUG] candidate-set save failed")
+
+    def _save_ledger_csv(self) -> Optional[str]:
+        """Persist the candidate ledger as CSV next to the debug crops."""
+        import csv
+
+        if not self._ledger:
+            return None
+        out_dir = self.debug_crops_dir or (Path("data") / "debug_ocr")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"candidate_ledger_{self.camera_id}.csv"
+        cols = ["frame", "track_id", "det_source", "plate_bbox", "det_conf",
+                "det_threshold", "crop_w", "crop_h", "aspect", "bumper_passed",
+                "ocr_raw_text", "ocr_raw_conf", "ocr_pre_text", "ocr_pre_conf",
+                "accept_text", "accept_conf", "corrected", "regex_pass",
+                "ocr_threshold", "variant_error", "final_reason"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(self._ledger)
+            logger.info("[LEDGER] wrote %d rows to %s", len(self._ledger), path)
+            return str(path)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            logger.exception("[LEDGER] CSV save failed")
+            return None
+
+    def _print_ledger_summary(self) -> None:
+        """Print det/OCR confidence distributions + gate survival + top reasons."""
+        from collections import Counter
+
+        d = self._diag
+        det_confs = [r["det_conf"] for r in self._ledger if r.get("det_conf") is not None]
+        ocr_confs = [r["accept_conf"] for r in self._ledger if r.get("accept_text")]
+        reasons = Counter(r["final_reason"] for r in self._ledger)
+
+        def _dist(xs: list[float]) -> str:
+            if not xs:
+                return "n/a (no samples)"
+            s = sorted(xs)
+            return (f"n={len(s)} min={s[0]:.3f} mean={sum(s)/len(s):.3f} "
+                    f"max={s[-1]:.3f} values={[round(v, 3) for v in s]}")
+
+        lines = [
+            "",
+            "===== CANDIDATE LEDGER SUMMARY (thresholds UNCHANGED) =====",
+            f"Plate-detector threshold         : {self.detector.plate_conf_threshold}",
+            f"OCR confidence threshold         : {self.min_ocr_confidence} "
+            "(below_gate = non-empty text with conf BELOW this)",
+            f"gate_cleared requires            : conf >= {self.min_ocr_confidence} AND regex pass",
+            f"format_rejected requires         : conf >= {self.min_ocr_confidence} AND regex FAIL",
+            f"Plate-detector conf distribution : {_dist(det_confs)}",
+            f"OCR accept-conf distribution     : {_dist(ocr_confs)}",
+            "Gate survival:",
+            f"  candidate_boxes={d['candidate_boxes']} aspect_rejected={d['aspect_rejected']} "
+            f"position_rejected={d['position_rejected']} tiny_rejected={d['tiny_rejected']} "
+            f"detector_conf_rejected={d['detector_conf_rejected']}",
+            f"  ocr_attempted={d['ocr_attempted']} ocr_empty={d['ocr_empty']} "
+            f"ocr_low_conf={d['ocr_low_conf']} regex_rejected={d['regex_rejected']} "
+            f"accepted={d['accepted']}",
+            "Top rejection reasons:",
+        ]
+        for reason, n in reasons.most_common():
+            lines.append(f"  {reason}: {n}")
+        lines.append("===========================================================")
+        text = "\n".join(lines)
+        print(text)
+        logger.info(text)
 
     def _handle_sighting(self, sighting: dict[str, Any]) -> None:
         """Persist a sighting to the shared DB and run the alert check."""
