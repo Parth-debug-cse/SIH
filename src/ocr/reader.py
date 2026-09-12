@@ -295,6 +295,12 @@ class PlateOCR:
         self._histories: dict[tuple, deque] = {}
         # track_key -> last-access time (for LRU eviction)
         self._last_access: dict[tuple, float] = {}
+        # Source-tagged observation log (diagnostic/integration stream).
+        # Appended by log_observation(); NEVER read by the voting path, so
+        # _aggregate/record_vote semantics are byte-identical with or
+        # without logging.  Each entry: text/confidence/track_key/source/
+        # frame/timestamp.
+        self._observations: list[dict] = []
         # Observability for the preprocessing stage (fix: was defined but
         # unverifiable in the real path).
         self.preprocess_count: int = 0
@@ -583,6 +589,82 @@ class PlateOCR:
             "raw_confidence": float(confidence),
             "voted_count": count,
             "voted": count >= 2,
+        }
+
+    def log_observation(
+        self,
+        text: str,
+        confidence: float,
+        track_key=None,
+        source: str = "easyocr",
+        frame: Optional[int] = None,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Append one source-tagged observation to the track-level log.
+
+        This stream is independent of the voting deques: logging never
+        changes ``record_vote``/``_aggregate`` behavior.  Empty texts are
+        ignored (nothing to fuse).
+        """
+        if not text:
+            return
+        key = tuple(track_key) if track_key is not None else _DEFAULT_KEY
+        self._observations.append({
+            "text": str(text),
+            "confidence": float(confidence),
+            "track_key": key,
+            "source": str(source),
+            "frame": frame,
+            "timestamp": time.time() if timestamp is None else float(timestamp),
+        })
+
+    def observations_for(self, track_key=None, source: Optional[str] = None) -> list[dict]:
+        """Return logged observations, optionally filtered by track/source."""
+        key = tuple(track_key) if track_key is not None else None
+        return [
+            o for o in self._observations
+            if (key is None or o["track_key"] == key)
+            and (source is None or o["source"] == source)
+        ]
+
+    def track_fusion_report(
+        self,
+        track_key,
+        source: str = "fastplate",
+        min_confidence: float = 0.50,
+    ) -> dict:
+        """Fuse one track's logged observations with the EXISTING fusion.
+
+        Runs :func:`fuse_track_observations` (position-aware,
+        confidence-weighted — unchanged) over the track's observations for
+        *source* and reports the verdict.  ``verdict`` mirrors the
+        acceptance gates for reporting ONLY: nothing here writes sightings.
+        Stability is never labeled correctness (see ``verified`` = False).
+        """
+        obs = self.observations_for(track_key, source=source)
+        pairs = [(o["text"], o["confidence"]) for o in obs]
+        fused = fuse_track_observations(pairs)
+        plate = fused["canonical_plate"]
+        regex = looks_like_plate(plate) if plate else False
+        if not plate:
+            verdict = "no_observations"
+        elif fused["aggregate_confidence"] < min_confidence:
+            verdict = "fused_conf_below_gate"
+        elif not regex:
+            verdict = "regex_fail"
+        else:
+            verdict = "would_accept_UNVERIFIED"
+        return {
+            "track_key": tuple(track_key),
+            "source": source,
+            "n_observations": len(obs),
+            "predictions": [(o["text"], o["confidence"], o["frame"]) for o in obs],
+            "fused": plate,
+            "fused_confidence": fused["aggregate_confidence"],
+            "method": fused["method"],
+            "regex_pass": regex,
+            "verdict": verdict,
+            "verified": False,
         }
 
     @staticmethod

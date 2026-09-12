@@ -338,6 +338,8 @@ class PipelineRunner:
         ledger_csv = self._save_ledger_csv()
         top5_csv = self._save_top5()
         fast_top5_csv = self._save_fast_top5()
+        track_reports = self._print_track_fusion_report()
+        stable_csv = self._save_stable_tracks(track_reports)
 
         summary["plate_diagnostics"] = {
             "vehicles_detected": self._diag["vehicles_detected"],
@@ -371,6 +373,9 @@ class PipelineRunner:
             "top5_direct_csv": top5_csv,
             "fast_trials": len(self._fast_trials),
             "fast_top5_csv": fast_top5_csv,
+            "fast_tracks": len({o["track_key"] for o in self.ocr._observations
+                                if o["source"] == "fastplate"}),
+            "stable_tracks_csv": stable_csv,
             "preprocess_calls": self._diag["preprocess_calls"],
             "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
@@ -627,6 +632,7 @@ class PipelineRunner:
             det_source = "fullframe_fallback" if from_fallback else "in_crop"
 
             track_id = veh_track_ids.get(idx)
+            track_key = self._track_key(track_id, frame_number, idx)
 
             # Bumper/position verdict for the ledger (report-only: fallback
             # boxes already passed the detector's internal filter, in-crop
@@ -799,8 +805,8 @@ class PipelineRunner:
                 self.camera_id, frame_number, idx, fast["text"],
                 fast["conf"], fast["regex_pass"], fast["status"],
             )
-
-            track_key = self._track_key(track_id, frame_number, idx)
+            # Track-level observation stream (both backends, source-tagged).
+            # Voting/deque semantics untouched; acceptance uses read_plate().
 
             self._diag["ocr_attempted"] += 1
             ocr_result = self.ocr.read_plate(crop, track_key=track_key)
@@ -814,6 +820,21 @@ class PipelineRunner:
                 logger.exception("[LEDGER] position_correct failed")
                 row["corrected"] = text
             row["regex_pass"] = bool(text) and looks_like_plate(text)
+
+            # Track-level observation stream (both backends, source-tagged).
+            # Placed AFTER the acceptance read so text/conf exist.  Logging
+            # never alters voting/deque semantics.
+            ts_obs = datetime.now().timestamp()
+            if text:
+                self.ocr.log_observation(text, conf, track_key,
+                                         source="easyocr",
+                                         frame=frame_number, timestamp=ts_obs)
+            if fast["text"]:
+                self.ocr.log_observation(
+                    fast["text"],
+                    fast["conf"] if fast["conf"] is not None else 0.0,
+                    track_key, source="fastplate",
+                    frame=frame_number, timestamp=ts_obs)
 
             entry = {
                 "bbox": [pbx1, pby1, pbx2, pby2],
@@ -1157,6 +1178,105 @@ class PipelineRunner:
             import traceback
             traceback.print_exc()
             logger.exception("[FASTPLATE] top-5 save failed")
+            return None
+
+    def _print_track_fusion_report(self) -> list[dict]:
+        """Fuse fastplate observations per track with the EXISTING fusion.
+
+        Prints track_id, observation count, individual predictions +
+        confidences, fused result + confidence, regex verdict and
+        accept/reject reason.  Report-only: no sightings written, no
+        thresholds changed.  Stability is NEVER labeled correctness.
+        Returns the per-track reports.
+        """
+        from collections import Counter
+
+        keys = sorted({o["track_key"] for o in self.ocr._observations
+                       if o["source"] == "fastplate"})
+        reports = []
+        lines = ["", "===== TRACK-LEVEL FASTPLATE FUSION (UNVERIFIED) =====",
+                 "Stability across frames is NOT correctness. Nothing below",
+                 "was accepted as ground truth or written as a sighting."]
+        for key in keys:
+            rep = self.ocr.track_fusion_report(key, source="fastplate",
+                                               min_confidence=self.min_ocr_confidence)
+            reports.append(rep)
+            tid = key[1] if len(key) > 1 else key
+            preds = ", ".join(f"'{t}'@{c:.3f}(f{f})" for t, c, f in rep["predictions"])
+            lines.append(
+                f"track={tid} n={rep['n_observations']} [{preds}] "
+                f"-> fused='{rep['fused']}' conf={rep['fused_confidence']} "
+                f"({rep['method']}) regex={rep['regex_pass']} verdict={rep['verdict']}"
+            )
+        if not reports:
+            lines.append("no fastplate observations logged")
+        easy_n = sum(1 for o in self.ocr._observations if o["source"] == "easyocr")
+        lines.append(f"easyocr observations logged: {easy_n} (acceptance path unchanged)")
+        lines.append("======================================================")
+        text = "\n".join(lines)
+        print(text)
+        logger.info(text)
+        return reports
+
+    def _save_stable_tracks(self, reports: list[dict]) -> Optional[str]:
+        """Save crops + CSV for tracks stable across frames (still UNVERIFIED).
+
+        Stable = >=3 fastplate observations with a most-common string seen
+        >=3 times.  Up to 3 highest-confidence crops per stable track
+        (max 5 tracks).  Images come from the diagnostic fastplate set.
+        """
+        import csv
+        from collections import Counter
+
+        stable = []
+        for rep in reports:
+            if rep["n_observations"] < 3:
+                continue
+            top, cnt = Counter(t for t, _, _ in rep["predictions"]).most_common(1)[0]
+            if cnt >= 3:
+                stable.append((rep, top, cnt))
+        stable = stable[:5]
+        if not stable:
+            logger.info("[STABLE] no stable tracks")
+            return None
+        out_dir = (self.debug_crops_dir or (Path("data") / "debug_ocr")) / "stable_tracks"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for rep, top, cnt in stable:
+                tid = rep["track_key"][1] if len(rep["track_key"]) > 1 else rep["track_key"]
+                cand = sorted(
+                    (e for e in self._fast_top_images if e["track_id"] == tid),
+                    key=lambda e: e["conf"], reverse=True,
+                )[:3]
+                for i, e in enumerate(cand):
+                    cv2.imwrite(
+                        str(out_dir / f"track{tid}_{i + 1}_conf{e['conf']:.3f}"
+                                       f"_f{e['frame']}.jpg"),
+                        e["image"],
+                    )
+            csv_path = out_dir / "stable_tracks.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f, fieldnames=["track_id", "n_observations", "top_string",
+                                   "top_count", "fused", "fused_confidence",
+                                   "regex_pass", "verdict", "verified"],
+                    extrasaction="ignore",
+                )
+                w.writeheader()
+                for rep, top, cnt in stable:
+                    tid = rep["track_key"][1] if len(rep["track_key"]) > 1 else rep["track_key"]
+                    w.writerow({"track_id": tid, "n_observations": rep["n_observations"],
+                                "top_string": top, "top_count": cnt,
+                                "fused": rep["fused"],
+                                "fused_confidence": rep["fused_confidence"],
+                                "regex_pass": rep["regex_pass"],
+                                "verdict": rep["verdict"], "verified": False})
+            logger.info("[STABLE] saved %d stable track(s) to %s", len(stable), out_dir)
+            return str(csv_path)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            logger.exception("[STABLE] save failed")
             return None
 
     def _print_ledger_summary(self) -> None:
