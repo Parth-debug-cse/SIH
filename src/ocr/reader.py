@@ -182,6 +182,78 @@ def fuse_track_observations(obs: list[tuple[str, float]]) -> dict:
             "observation_count": len(group), "method": "per_position_weighted"}
 
 
+# Direct-recognition preprocessing variants (diagnostic experiment).
+# A: raw crop | B: 3x INTER_CUBIC | C: gray+CLAHE+upscale |
+# D: gray+OTSU+upscale | E: mild sharpen+upscale |
+# F: perspective warp (requires a quadrilateral; skipped otherwise).
+VARIANT_NAMES = ("A_raw", "B_3x", "C_clahe", "D_otsu", "E_sharpen", "F_persp")
+
+
+def build_variant_images(
+    crop: np.ndarray,
+    quad: Optional[list] = None,
+    upscale: float = 3.0,
+) -> dict[str, Optional[np.ndarray]]:
+    """Build greyscale OCR variants A–F from a plate crop (pure cv2, no model).
+
+    Args:
+        crop: BGR or greyscale plate crop.
+        quad: optional 4 corner points for perspective correction (variant F).
+            Without a quadrilateral, F is returned as None ("skipped").
+    """
+    if crop is None or crop.size == 0:
+        raise ValueError("crop is empty or None")
+    if crop.ndim == 3 and crop.shape[2] == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    elif crop.ndim == 2:
+        gray = crop.copy()
+    else:
+        raise ValueError(f"Unexpected image shape: {crop.shape}")
+
+    def _up(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        s = float(upscale) if max(h, w) * float(upscale) <= 1200 else 1200.0 / max(h, w)
+        return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+    variants: dict[str, Optional[np.ndarray]] = {
+        "A_raw": gray,
+        "B_3x": _up(gray),
+    }
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    variants["C_clahe"] = _up(clahe.apply(gray))
+    # Threshold AFTER upscaling so the variant stays truly binary
+    # (cubic interpolation would otherwise reintroduce grey fringes).
+    _, otsu = cv2.threshold(_up(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants["D_otsu"] = otsu
+    base = _up(gray)
+    blur = cv2.GaussianBlur(base, (0, 0), 1.0)
+    variants["E_sharpen"] = cv2.addWeighted(base, 1.5, blur, -0.5, 0.0)
+
+    if quad is None:
+        variants["F_persp"] = None
+    else:
+        try:
+            import numpy as _np
+
+            pts = _np.asarray(quad, dtype=float).reshape(4, 2)
+            (tl, tr, br, bl) = pts
+            w_a = _np.linalg.norm(br - bl)
+            w_b = _np.linalg.norm(tr - tl)
+            h_a = _np.linalg.norm(tr - br)
+            h_b = _np.linalg.norm(tl - bl)
+            dst_w, dst_h = max(int(max(w_a, w_b)), 8), max(int(max(h_a, h_b)), 8)
+            dst = _np.array(
+                [[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]],
+                dtype=float,
+            )
+            m = cv2.getPerspectiveTransform(pts.astype(_np.float32), dst.astype(_np.float32))
+            warped = cv2.warpPerspective(gray, m, (dst_w, dst_h), flags=cv2.INTER_CUBIC)
+            variants["F_persp"] = _up(warped)
+        except Exception:
+            variants["F_persp"] = None
+    return variants
+
+
 def looks_like_plate(text: str) -> bool:
     """Permissive check that *text* is a plausible Indian plate string.
 
@@ -582,6 +654,76 @@ class PlateOCR:
                 results.append({"text": "", "confidence": 0.0, "raw_text": "",
                                 "raw_confidence": 0.0, "voted_count": 0, "voted": False})
         return results
+
+    def recognize_image(self, grey_img: np.ndarray) -> tuple[str, float]:
+        """Direct whole-crop recognition, bypassing EasyOCR's text detector.
+
+        Verified against installed EasyOCR (1.7.2,
+        ``easyocr.py:353-375``): ``recognize(grey, horizontal_list=None)``
+        treats the whole image as one region ``[[0, x_max, 0, y_max]]`` and
+        returns ``[(box, text, conf)]``.  Only the verified ``allowlist``
+        kwarg is passed (guarded by signature inspection for robustness
+        across EasyOCR versions).  Raises on failure — the caller logs it.
+        """
+        import inspect
+        import traceback
+
+        try:
+            params = inspect.signature(self.reader.recognize).parameters
+        except (ValueError, TypeError):
+            traceback.print_exc()
+            params = {}
+        kwargs: dict = {}
+        if "allowlist" in params or not params:
+            kwargs["allowlist"] = OCR_ALLOWLIST
+        res = self.reader.recognize(grey_img, **kwargs)
+        if not res:
+            return "", 0.0
+        _box, text, conf = res[0]
+        return self._clean_plate_text(str(text)), float(conf)
+
+    def recognize_variants(
+        self,
+        crop: np.ndarray,
+        quad: Optional[list] = None,
+    ) -> list[dict]:
+        """Run direct recognition over variants A–F (diagnostic experiment).
+
+        Touches no vote history — pure function of the crop.  Each trial
+        carries ``variant/text/conf/normalized/regex_pass/status`` plus the
+        variant ``image`` (used for top-5 Drive saves; excluded from CSVs).
+        Failures are logged with tracebacks and recorded, never swallowed.
+        """
+        import traceback
+
+        trials: list[dict] = []
+        try:
+            images = build_variant_images(crop, quad=quad)
+        except Exception:
+            traceback.print_exc()
+            logger.exception("variant build failed")
+            return trials
+        for name in VARIANT_NAMES:
+            img = images.get(name)
+            if img is None:
+                trials.append({"variant": name, "text": "", "conf": 0.0,
+                               "normalized": "", "regex_pass": False,
+                               "status": "skipped_no_quad", "image": None})
+                continue
+            try:
+                text, conf = self.recognize_image(img)
+                norm = self._normalize_confusions(text) if text else ""
+                trials.append({"variant": name, "text": text, "conf": conf,
+                               "normalized": norm,
+                               "regex_pass": looks_like_plate(norm),
+                               "status": "ok", "image": img})
+            except Exception:
+                traceback.print_exc()
+                logger.exception("direct recognize failed for variant %s", name)
+                trials.append({"variant": name, "text": "", "conf": 0.0,
+                               "normalized": "", "regex_pass": False,
+                               "status": "failed", "image": img})
+        return trials
 
     def clear_history(self, track_key=None) -> None:
         """Reset voting history.

@@ -155,6 +155,10 @@ class PipelineRunner:
         # Candidate ledger: one row per evaluated plate box (diagnostic
         # only; never influences acceptance).  See _record_candidate().
         self._ledger: list[dict[str, Any]] = []
+        # Direct-recognition trials across variants A–F (diagnostic only).
+        self._variant_trials: list[dict[str, Any]] = []
+        # Best-variant images retained for the top-5 Drive save.
+        self._top_images: list[dict[str, Any]] = []
 
         # Per-run diagnostics for the detection -> OCR path.
         self._diag: dict[str, Any] = {
@@ -328,6 +332,7 @@ class PipelineRunner:
         self._diag["detector_conf_rejected"] = self._diag["no_plate_box_found"]
 
         ledger_csv = self._save_ledger_csv()
+        top5_csv = self._save_top5()
 
         summary["plate_diagnostics"] = {
             "vehicles_detected": self._diag["vehicles_detected"],
@@ -357,6 +362,8 @@ class PipelineRunner:
             "accepted": self._diag["accepted"],
             "candidate_ledger_csv": ledger_csv,
             "candidate_ledger_rows": len(self._ledger),
+            "variant_trials": len(self._variant_trials),
+            "top5_direct_csv": top5_csv,
             "preprocess_calls": self._diag["preprocess_calls"],
             "preprocessed_crop_saved": self._diag["preprocessed_crop_saved"],
         }
@@ -641,8 +648,10 @@ class PipelineRunner:
                 "ocr_pre_text": "", "ocr_pre_conf": 0.0,
                 "accept_text": "", "accept_conf": 0.0,
                 "corrected": "", "regex_pass": False,
+                "best_variant": "", "best_variant_text": "", "best_variant_conf": 0.0,
                 "ocr_threshold": self.min_ocr_confidence,
                 "variant_error": "",
+                "direct_error": "",
                 "final_reason": "",
             }
 
@@ -704,11 +713,56 @@ class PipelineRunner:
             # history touched): raw 3x-upscaled vs full CLAHE+upscale+unsharp
             # preprocessing.  Acceptance below uses read_plate() unchanged.
             variants = self._diagnose_variants(crop, frame_number, idx)
-            row["ocr_raw_text"] = variants["raw_text"]
-            row["ocr_raw_conf"] = variants["raw_conf"]
             row["ocr_pre_text"] = variants["pre_text"]
             row["ocr_pre_conf"] = variants["pre_conf"]
             row["variant_error"] = variants["error"]
+
+            # Direct-recognition experiment (diagnostic ONLY — acceptance
+            # below still uses read_plate() unchanged): whole-crop
+            # recognize() over variants A–F, bypassing text detection.
+            import traceback as _tb
+
+            direct_trials: list[dict[str, Any]] = []
+            try:
+                direct_trials = self.ocr.recognize_variants(crop)
+            except Exception:
+                _tb.print_exc()
+                logger.exception("[DIAG] %s frame=%d veh=%d direct-recognize failed",
+                                 self.camera_id, frame_number, idx)
+                row["direct_error"] = "recognize_variants raised"
+            for t in direct_trials:
+                self._variant_trials.append({
+                    "frame": frame_number, "track_id": track_id,
+                    "det_source": det_source,
+                    "plate_bbox": str([int(v) for v in best["bbox"]]),
+                    "det_conf": det_conf,
+                    "variant": t["variant"], "text": t["text"],
+                    "conf": t["conf"], "normalized": t["normalized"],
+                    "regex_pass": t["regex_pass"], "status": t["status"],
+                })
+            scored = [t for t in direct_trials
+                      if t["status"] == "ok" and t["text"]]
+            best_trial = max(scored, key=lambda t: t["conf"]) if scored else None
+            if best_trial is not None:
+                row["best_variant"] = best_trial["variant"]
+                row["best_variant_text"] = best_trial["text"]
+                row["best_variant_conf"] = best_trial["conf"]
+                if best_trial["image"] is not None:
+                    self._top_images.append({
+                        "conf": best_trial["conf"],
+                        "image": best_trial["image"],
+                        "frame": frame_number, "track_id": track_id,
+                        "variant": best_trial["variant"],
+                        "text": best_trial["text"],
+                        "det_conf": det_conf,
+                        "normalized": best_trial["normalized"],
+                    })
+            logger.info(
+                "[DIRECT] %s frame=%d veh=%d trials=%s",
+                self.camera_id, frame_number, idx,
+                [(t["variant"], t["text"], round(t["conf"], 3), t["status"])
+                 for t in direct_trials],
+            )
 
             track_key = self._track_key(track_id, frame_number, idx)
 
@@ -944,7 +998,8 @@ class PipelineRunner:
                 "det_threshold", "crop_w", "crop_h", "aspect", "bumper_passed",
                 "ocr_raw_text", "ocr_raw_conf", "ocr_pre_text", "ocr_pre_conf",
                 "accept_text", "accept_conf", "corrected", "regex_pass",
-                "ocr_threshold", "variant_error", "final_reason"]
+                "best_variant", "best_variant_text", "best_variant_conf",
+                "ocr_threshold", "variant_error", "direct_error", "final_reason"]
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -956,6 +1011,46 @@ class PipelineRunner:
             import traceback
             traceback.print_exc()
             logger.exception("[LEDGER] CSV save failed")
+            return None
+
+    def _save_top5(self) -> Optional[str]:
+        """Save the top-5 direct-recognition trials by OCR confidence.
+
+        Writes 5 variant images + ``top5_direct.csv`` (frame, bbox, det
+        conf, variant, text, conf, normalized, regex) to Drive for visual
+        inspection.  Bounded by construction: never more than 5 images.
+        """
+        import csv
+
+        if not self._top_images:
+            return None
+        out_dir = (self.debug_crops_dir or (Path("data") / "debug_ocr")) / "top5"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ranked = sorted(self._top_images, key=lambda e: e["conf"], reverse=True)[:5]
+        try:
+            for i, e in enumerate(ranked):
+                cv2.imwrite(
+                    str(out_dir / f"top{i + 1}_{e['variant']}_conf{e['conf']:.3f}"
+                                   f"_f{e['frame']}_t{e['track_id']}.jpg"),
+                    e["image"],
+                )
+            csv_path = out_dir / "top5_direct.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=["frame", "track_id", "variant", "text", "conf",
+                                "normalized", "det_conf"],
+                    extrasaction="ignore",
+                )
+                w.writeheader()
+                for e in ranked:
+                    w.writerow(e)
+            logger.info("[DIRECT] saved top-5 to %s", out_dir)
+            return str(csv_path)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            logger.exception("[DIRECT] top-5 save failed")
             return None
 
     def _print_ledger_summary(self) -> None:
