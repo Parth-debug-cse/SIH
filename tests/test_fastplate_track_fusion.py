@@ -41,15 +41,15 @@ print("report:", {k: rep[k] for k in ("n_observations", "fused", "fused_confiden
 check("5 observations", rep["n_observations"] == 5)
 check("deterministic fused string", rep["fused"] == "40GD7030")
 check("method per-position", rep["method"] == "per_position_weighted")
-check("non-plate verdict", rep["verdict"] == "regex_fail")
+check("non-plate verdict", rep["verdict"] == "format_rejected")
 check("never verified", rep["verified"] is False)
 
-# 1b. Regex-passing singleton still flagged UNVERIFIED, never correct.
+# 1b. Fake-state-code singleton is rejected by the whitelist (never "close").
 ocr.log_observation("GD75000", 0.587, ("cam_wa", 9), source="fastplate", frame=20)
 rep2 = ocr.track_fusion_report(("cam_wa", 9), source="fastplate")
 check("singleton method", rep2["method"] == "single")
-check("regex passes", rep2["regex_pass"] is True)
-check("verdict unverified", rep2["verdict"] == "would_accept_UNVERIFIED"
+check("fake state code rejected", rep2["regex_pass"] is False)
+check("verdict names the cause", rep2["verdict"] == "invalid_state_code"
       and rep2["verified"] is False)
 
 # 2. Voting semantics byte-identical with/without logging.

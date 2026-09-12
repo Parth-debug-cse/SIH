@@ -32,7 +32,13 @@ from src.detection.detector import (
     PlateDetector,
     resolve_plate_model_from_hub,
 )
-from src.ocr.reader import PlateOCR, looks_like_plate, position_correct
+from src.ocr.reader import (
+    HybridPlateOCR,
+    PlateOCR,
+    is_valid_india_plate,
+    looks_like_plate,
+    position_correct,
+)
 from src.tracking.tracker import VehicleTracker
 from src.alerts.engine import AlertEngine
 from src.db.schema import insert_row
@@ -145,6 +151,9 @@ class PipelineRunner:
         plate_model_path = resolve_plate_model_from_hub()
         self.detector = PlateDetector(device=self.device, plate_model_path=plate_model_path)
         self.ocr = PlateOCR()
+        # Primary OCR: height-gated fast-plate-ocr with EasyOCR fallback.
+        # Shares self.ocr so fallback voting history is preserved.
+        self.hybrid = HybridPlateOCR(easy_ocr=self.ocr)
         self.tracker = VehicleTracker()
         self.alert_engine = AlertEngine()
         self.analytics = TrafficAnalytics(cameras_config_path=str(self._cameras_config_path))
@@ -661,6 +670,7 @@ class PipelineRunner:
                 "ocr_pre_text": "", "ocr_pre_conf": 0.0,
                 "accept_text": "", "accept_conf": 0.0,
                 "corrected": "", "regex_pass": False,
+                "engine_used": "", "validity_reason": "",
                 "best_variant": "", "best_variant_text": "", "best_variant_conf": 0.0,
                 "fast_text": "", "fast_conf": None,
                 "ocr_threshold": self.min_ocr_confidence,
@@ -809,9 +819,17 @@ class PipelineRunner:
             # Voting/deque semantics untouched; acceptance uses read_plate().
 
             self._diag["ocr_attempted"] += 1
-            ocr_result = self.ocr.read_plate(crop, track_key=track_key)
-            text = ocr_result["text"]
-            conf = ocr_result["confidence"]
+            # Primary acceptance read: height-gated hybrid (fast-plate-ocr
+            # on crops >= 65px, EasyOCR fallback below).  The 0.50 gate and
+            # validity check below are UNCHANGED in threshold.
+            hybrid_res = self.hybrid.read_plate(
+                crop, crop_height_px=crop_h, track_key=track_key
+            )
+            text = hybrid_res["text"]
+            conf = hybrid_res["confidence"]  # None when backend gives none
+            engine_used = hybrid_res["engine_used"]
+            row["engine_used"] = engine_used
+            row["validity_reason"] = hybrid_res["validity_reason"]
             row["accept_text"] = text
             row["accept_conf"] = conf
             try:
@@ -819,17 +837,26 @@ class PipelineRunner:
             except Exception:
                 logger.exception("[LEDGER] position_correct failed")
                 row["corrected"] = text
-            row["regex_pass"] = bool(text) and looks_like_plate(text)
+            row["regex_pass"] = hybrid_res["regex_pass"]
+            logger.info(
+                "[OCR] %s frame=%d veh=%d engine=%s text='%s' conf=%s regex=%s (%s)",
+                self.camera_id, frame_number, idx, engine_used, text, conf,
+                hybrid_res["regex_pass"], hybrid_res["validity_reason"],
+            )
 
             # Track-level observation stream (both backends, source-tagged).
-            # Placed AFTER the acceptance read so text/conf exist.  Logging
-            # never alters voting/deque semantics.
+            # Exactly one log entry per backend per candidate (no duplicates):
+            # the hybrid accept carries its engine's observation; the
+            # diagnostic fastplate read is logged only when the hybrid did
+            # NOT already produce a fastplate read for this crop (e.g. tiny
+            # crops routed to EasyOCR — this preserves the cam_1 A/B stream).
+            # Logging never alters voting/deque semantics.
             ts_obs = datetime.now().timestamp()
             if text:
-                self.ocr.log_observation(text, conf, track_key,
-                                         source="easyocr",
+                self.ocr.log_observation(text, conf if conf is not None else 0.0,
+                                         track_key, source=engine_used,
                                          frame=frame_number, timestamp=ts_obs)
-            if fast["text"]:
+            if fast["text"] and engine_used != "fastplate":
                 self.ocr.log_observation(
                     fast["text"],
                     fast["conf"] if fast["conf"] is not None else 0.0,
@@ -862,18 +889,22 @@ class PipelineRunner:
                 self._record_candidate(row)
                 continue
 
-            # Gate 1 (UNCHANGED): OCR confidence >= min_ocr_confidence.
-            # below_gate fires only here — non-empty text under threshold.
-            if conf < self.min_ocr_confidence:
+            # Gate 1 (UNCHANGED threshold 0.50; None-safe: a backend that
+            # provides no confidence cannot pass).  Non-empty text under
+            # threshold on a sub-65px crop is a resolution-floor rejection.
+            if conf is None or conf < self.min_ocr_confidence:
+                cstr = f"{conf:.2f}" if conf is not None else "none"
                 logger.info(
                     "[OCR] %s frame=%d veh=%d plate found but below confidence "
-                    "gate '%s' (conf=%.2f < %.2f)",
+                    "gate '%s' (conf=%s < %.2f)",
                     self.camera_id, frame_number, idx,
-                    text, conf, self.min_ocr_confidence,
+                    text, cstr, self.min_ocr_confidence,
                 )
                 self._diag["plate_found_below_gate"] += 1
                 self._diag["ocr_low_conf"] += 1
-                row["final_reason"] = "ocr_low_conf"
+                row["final_reason"] = ("below_resolution_floor"
+                                       if (crop_h or 0) < HybridPlateOCR.MIN_HEIGHT_FOR_FASTPLATE
+                                       else "ocr_low_conf")
                 self._save_candidate_set("low_conf", frame, crop, variants,
                                          [pbx1, pby1, pbx2, pby2], veh["bbox"],
                                          frame_number, idx)
@@ -884,21 +915,23 @@ class PipelineRunner:
             # (format) gate so "before vs after" is quantifiable.
             self._diag["plate_conf_cleared"] += 1
 
-            # Gate 2 (UNCHANGED), alongside Gate 1: Indian plate format.
-            # format_rejected fires only here — confident but non-plate text.
-            if not looks_like_plate(text):
+            # Gate 2 (TIGHTENED check, same position): format + real Indian
+            # state code via is_valid_india_plate.  Fires only here —
+            # confident text that is not a valid Indian plate.
+            if not hybrid_res["regex_pass"]:
                 logger.info(
-                    "[OCR] %s frame=%d veh=%d plate found but format check "
-                    "failed '%s' (conf=%.2f >= %.2f)",
+                    "[OCR] %s frame=%d veh=%d plate found but validity check "
+                    "failed '%s' (conf=%.2f >= %.2f, reason=%s)",
                     self.camera_id, frame_number, idx,
                     text, conf, self.min_ocr_confidence,
+                    hybrid_res["validity_reason"],
                 )
                 self._diag["plate_confidence_cleared_format_rejected"] += 1
                 self._diag["regex_rejected"] += 1
                 samples = self._diag["plate_format_rejected_samples"]
                 if len(samples) < 30:
                     samples.append(text)
-                row["final_reason"] = "regex_rejected"
+                row["final_reason"] = hybrid_res["validity_reason"]
                 self._save_candidate_set("regex_rejected", frame, crop, variants,
                                          [pbx1, pby1, pbx2, pby2], veh["bbox"],
                                          frame_number, idx)
@@ -1002,18 +1035,22 @@ class PipelineRunner:
     def _record_candidate(self, row: dict[str, Any]) -> None:
         """Append one candidate row to the ledger with a compact log line."""
         self._ledger.append(row)
+
+        def _c(v: Any) -> str:
+            return f"{v:.3f}" if isinstance(v, (int, float)) else "none"
+
         logger.info(
             "[CANDIDATE] %s frame=%d track=%s src=%s bbox=%s det_conf=%.3f(>=%.2f) "
-            "crop=%sx%s aspect=%s bumper=%s | raw='%s'@%.3f pre='%s'@%.3f "
-            "accept='%s'@%.3f corrected='%s' regex=%s thr=%.2f -> %s",
+            "crop=%sx%s aspect=%s bumper=%s | raw='%s'@%s pre='%s'@%s "
+            "accept(engine=%s)'%s'@%s corrected='%s' regex=%s(%s) thr=%.2f -> %s",
             self.camera_id, row["frame"], row["track_id"], row["det_source"],
             row["plate_bbox"], row["det_conf"], row["det_threshold"],
             row["crop_w"], row["crop_h"], row["aspect"], row["bumper_passed"],
-            row["ocr_raw_text"], row["ocr_raw_conf"],
-            row["ocr_pre_text"], row["ocr_pre_conf"],
-            row["accept_text"], row["accept_conf"],
-            row["corrected"], row["regex_pass"], row["ocr_threshold"],
-            row["final_reason"],
+            row["ocr_raw_text"], _c(row["ocr_raw_conf"]),
+            row["ocr_pre_text"], _c(row["ocr_pre_conf"]),
+            row.get("engine_used"), row["accept_text"], _c(row["accept_conf"]),
+            row["corrected"], row["regex_pass"], row.get("validity_reason"),
+            row["ocr_threshold"], row["final_reason"],
         )
 
     def _save_candidate_set(self, reason: str, frame, crop, variants,
@@ -1055,6 +1092,7 @@ class PipelineRunner:
                 "det_threshold", "crop_w", "crop_h", "aspect", "bumper_passed",
                 "ocr_raw_text", "ocr_raw_conf", "ocr_pre_text", "ocr_pre_conf",
                 "accept_text", "accept_conf", "corrected", "regex_pass",
+                "engine_used", "validity_reason",
                 "best_variant", "best_variant_text", "best_variant_conf",
                 "fast_text", "fast_conf",
                 "ocr_threshold", "variant_error", "direct_error", "final_reason"]
@@ -1091,7 +1129,9 @@ class PipelineRunner:
             out["status"] = res["status"]
             norm = self.ocr._normalize_confusions(res["text"]) if res["text"] else ""
             out["normalized"] = norm
-            out["regex_pass"] = looks_like_plate(norm)
+            # Display validity (format + state code), consistent with Gate 2.
+            valid, _ = is_valid_india_plate(norm) if norm else (False, 'empty')
+            out["regex_pass"] = valid
         except Exception:
             traceback.print_exc()
             logger.exception("[FASTPLATE] %s frame=%d veh=%d failed",
@@ -1285,7 +1325,9 @@ class PipelineRunner:
 
         d = self._diag
         det_confs = [r["det_conf"] for r in self._ledger if r.get("det_conf") is not None]
-        ocr_confs = [r["accept_conf"] for r in self._ledger if r.get("accept_text")]
+        ocr_confs = [r["accept_conf"] for r in self._ledger
+                     if r.get("accept_text")
+                     and isinstance(r.get("accept_conf"), (int, float))]
         reasons = Counter(r["final_reason"] for r in self._ledger)
 
         def _dist(xs: list[float]) -> str:

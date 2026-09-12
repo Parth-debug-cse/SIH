@@ -266,6 +266,36 @@ def looks_like_plate(text: str) -> bool:
     return bool(PLATE_PATTERN.match(text.replace(" ", "").upper()))
 
 
+# Real Indian state/UT RTO codes (whitelist).  Format-valid strings with a
+# fake code — 'AA05440', 'GD75000' — passed the old permissive regex and must
+# now be rejected.  'GD' is not a state code; neither is 'AA'.
+INDIA_STATE_CODES = frozenset({
+    'AN', 'AP', 'AR', 'AS', 'BR', 'CH', 'CG', 'DD', 'DL', 'DN', 'GA', 'GJ',
+    'HR', 'HP', 'JH', 'JK', 'KA', 'KL', 'LA', 'LD', 'MH', 'ML', 'MN', 'MP',
+    'MZ', 'NL', 'OD', 'PB', 'PY', 'RJ', 'SK', 'TN', 'TS', 'TR', 'UK', 'UP',
+    'WB',
+})
+
+PLATE_FORMAT_RE = re.compile(r'^([A-Z]{2})\d{1,2}[A-Z]{0,3}\d{3,4}$')
+
+
+def is_valid_india_plate(text: str) -> tuple[bool, str]:
+    """Two-stage Indian plate check: format first, then state-code whitelist.
+
+    Returns ``(is_valid, reason)`` where reason is one of ``'ok'``,
+    ``'empty'``, ``'format_rejected'``, ``'invalid_state_code'``.
+    """
+    if not text:
+        return False, 'empty'
+    s = text.replace(" ", "").upper()
+    m = PLATE_FORMAT_RE.match(s)
+    if not m:
+        return False, 'format_rejected'
+    if m.group(1) not in INDIA_STATE_CODES:
+        return False, 'invalid_state_code'
+    return True, 'ok'
+
+
 class PlateOCR:
     """License plate OCR engine with preprocessing and multi-frame voting.
 
@@ -645,13 +675,16 @@ class PlateOCR:
         pairs = [(o["text"], o["confidence"]) for o in obs]
         fused = fuse_track_observations(pairs)
         plate = fused["canonical_plate"]
-        regex = looks_like_plate(plate) if plate else False
+        # Validity (format + real state code) — the fusion math above is
+        # unchanged; only the verdict gate is tightened.
+        valid, vreason = is_valid_india_plate(plate) if plate else (False, 'empty')
+        regex = valid
         if not plate:
             verdict = "no_observations"
         elif fused["aggregate_confidence"] < min_confidence:
             verdict = "fused_conf_below_gate"
         elif not regex:
-            verdict = "regex_fail"
+            verdict = vreason  # 'format_rejected' or 'invalid_state_code'
         else:
             verdict = "would_accept_UNVERIFIED"
         return {
@@ -663,6 +696,7 @@ class PlateOCR:
             "fused_confidence": fused["aggregate_confidence"],
             "method": fused["method"],
             "regex_pass": regex,
+            "validity_reason": vreason,
             "verdict": verdict,
             "verified": False,
         }
@@ -795,9 +829,12 @@ class PlateOCR:
             try:
                 text, conf = self.recognize_image(img)
                 norm = self._normalize_confusions(text) if text else ""
+                # Display validity (format + state code); internal ranking
+                # math (_row_candidate_score) is unchanged.
+                valid, _ = is_valid_india_plate(norm) if norm else (False, 'empty')
                 trials.append({"variant": name, "text": text, "conf": conf,
                                "normalized": norm,
-                               "regex_pass": looks_like_plate(norm),
+                               "regex_pass": valid,
                                "status": "ok", "image": img})
             except Exception:
                 traceback.print_exc()
@@ -820,3 +857,99 @@ class PlateOCR:
         key = tuple(track_key)
         self._histories.pop(key, None)
         self._last_access.pop(key, None)
+
+
+class HybridPlateOCR:
+    """
+    Routes plate crops to fast-plate-ocr (primary) or EasyOCR (fallback) based on
+    crop height, because fast-plate-ocr produces confident WRONG reads on crops
+    under ~65px tall (verified: cam_1, 43-51px crops, hallucinated 'GD' state-code
+    pattern at 0.77-0.84 conf). EasyOCR is strictly worse on adequately-sized crops
+    (verified: cam_2, mean accept_conf 0.25 vs fast-plate-ocr's 0.5-0.99) but at
+    least fails toward low-confidence/empty rather than confident-wrong on tiny crops.
+
+    The numeric acceptance gate (0.50) stays in the caller (pipeline_runner):
+    this class reports text/confidence/engine/validity and NEVER thresholds.
+    """
+
+    MIN_HEIGHT_FOR_FASTPLATE = 65  # px; below this, fast-plate-ocr is unreliable
+
+    def __init__(
+        self,
+        use_gpu: bool = True,
+        hub_ocr_model: str = 'cct-s-v2-global-model',
+        easy_ocr: Optional["PlateOCR"] = None,
+        fast_backend=None,
+    ) -> None:
+        # EasyOCR fallback: shared PlateOCR (vote history preserved) or own.
+        self.easy: PlateOCR = easy_ocr if easy_ocr is not None else PlateOCR(
+            use_gpu=use_gpu
+        )
+        self._fast = fast_backend  # FastPlateOCR or None (lazy)
+        self.hub_ocr_model = hub_ocr_model
+        self.use_gpu = use_gpu
+
+    @property
+    def fast(self):
+        """Lazily build the fast-plate-ocr backend (model downloads once)."""
+        if self._fast is None:
+            from src.ocr.fastplate import FastPlateOCR
+
+            # 'auto' is deduced from onnxruntime providers (verified
+            # constructor literal); 'cpu' when no GPU requested.
+            self._fast = FastPlateOCR(
+                model_name=self.hub_ocr_model,
+                device='auto' if self.use_gpu else 'cpu',
+            )
+        return self._fast
+
+    def read_plate(
+        self,
+        crop_bgr: np.ndarray,
+        crop_height_px: Optional[int] = None,
+        track_key=None,
+    ) -> dict:
+        """Route one crop to fast-plate-ocr or the EasyOCR fallback.
+
+        Returns dict with keys: text, confidence (None when the backend
+        provides none — never fabricated), engine_used
+        ('fastplate'/'easyocr'), regex_pass (via :func:`is_valid_india_plate`),
+        validity_reason, reason.
+
+        Engine failures are LOUD (traceback printed) but non-fatal: they
+        return ``reason='engine_failed'`` with empty text so one bad crop
+        cannot kill a video run — the traceback, not silence, is the record.
+        """
+        import traceback
+
+        h = int(crop_height_px) if crop_height_px else int(crop_bgr.shape[0])
+        if h >= self.MIN_HEIGHT_FOR_FASTPLATE:
+            try:
+                res = self.fast.read_crop(crop_bgr)
+            except Exception:
+                traceback.print_exc()
+                logger.exception("HybridPlateOCR fastplate path failed")
+                return {"text": "", "confidence": None, "engine_used": "fastplate",
+                        "regex_pass": False, "validity_reason": "engine_failed",
+                        "reason": "engine_failed"}
+            valid, vreason = is_valid_india_plate(res["text"]) if res["text"] else (False, 'empty')
+            return {"text": res["text"], "confidence": res["conf"],
+                    "engine_used": "fastplate", "regex_pass": valid,
+                    "validity_reason": vreason,
+                    "reason": "ok" if res["text"] else "fastplate_empty"}
+        try:
+            res = self.easy.read_plate(crop_bgr, track_key=track_key)
+        except Exception:
+            traceback.print_exc()
+            logger.exception("HybridPlateOCR easyocr path failed")
+            return {"text": "", "confidence": 0.0, "engine_used": "easyocr",
+                    "regex_pass": False, "validity_reason": "engine_failed",
+                    "reason": "engine_failed"}
+        if not res["text"]:
+            return {"text": "", "confidence": 0.0, "engine_used": "easyocr",
+                    "regex_pass": False, "validity_reason": "empty",
+                    "reason": "below_resolution_floor"}
+        valid, vreason = is_valid_india_plate(res["text"])
+        return {"text": res["text"], "confidence": res["confidence"],
+                "engine_used": "easyocr", "regex_pass": valid,
+                "validity_reason": vreason, "reason": "easyocr_fallback"}
