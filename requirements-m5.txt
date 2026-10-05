@@ -1,0 +1,42 @@
+# Phase 1 — Apple M5 ingestion + YOLO11 detection (macOS arm64).
+# Base requirements.txt stays the Windows-CPU pinned env; install this file
+# ON TOP of it on Apple Silicon:
+#   pip install -r requirements.txt -r requirements-m5.txt
+#
+# NOTE: torch>=2.2 macOS arm64 wheels ship with MPS. Do NOT use the
+# +cpu index with this file. coremltools/mlx are macOS-only and are
+# guarded by platform markers so Linux/Windows installs skip them.
+
+# --- Hardware video decode (VideoToolbox via ffmpeg libs) ---
+av>=11.0.0
+
+# --- Detection: YOLO11 + Apple backends ---
+ultralytics>=8.3.0  # provides yolo11*.pt + .export(format="coreml")
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- ANE / CoreML export + runtime (macOS arm64 only) ---
+coremltools>=7.2; platform_machine=="arm64" and sys_platform=="darwin"
+mlx>=0.16.0; platform_machine=="arm64" and sys_platform=="darwin"
+
+# --- Phase 3: plate enhance + OCR (MLX LPRNet primary, Vision fallback) ---
+# Real-ESRGAN upscale path (auto-used when weights + torch/MPS present;
+# otherwise Lanczos+unsharp resampling — zero extra deps):
+realesrgan>=0.3.0; platform_machine=="arm64" and sys_platform=="darwin"
+basicsr>=1.4.2; platform_machine=="arm64" and sys_platform=="darwin"
+# Zero-latency on-device fallback (macOS only, used via pyobjc lazily):
+pyobjc-framework-Vision>=10.0; sys_platform=="darwin"
+# Imaging for the cv2-free resample path:
+pillow>=10.0.0
+
+# --- Phase 2: MOT + Re-ID (custom OC-SORT has NO hard new deps) ---
+# Optional Hungarian optimal matching (greedy fallback built in):
+scipy>=1.11.0
+# Optional OSNet/FastReID weights (auto-used when present; the tracker
+# works without them via the built-in histogram embedding):
+torchreid>=1.4.0; platform_machine=="arm64" and sys_platform=="darwin"
+
+# --- Schemas / infra (already in base, pinned here for clarity) ---
+pydantic>=2.0.0
+numpy>=1.26.0
+opencv-python>=4.9.0  # frame resize/color-convert ONLY (never VideoCapture)
